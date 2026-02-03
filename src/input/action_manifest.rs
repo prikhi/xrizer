@@ -613,6 +613,8 @@ enum ActionBinding {
     ToggleButton {
         path: String,
         inputs: ButtonInput,
+        #[expect(unused)]
+        parameters: Option<serde_json::Map<String, serde_json::Value>>,
     },
     Dpad {
         path: String,
@@ -1144,7 +1146,11 @@ fn handle_sources(
 
         match mode {
             ActionBinding::None(_) => {}
-            ActionBinding::ToggleButton { path, inputs } => {
+            ActionBinding::ToggleButton {
+                path,
+                inputs,
+                parameters: _,
+            } => {
                 bind_button_touch!(path, inputs);
 
                 if let Some(ActionBindingOutput { output }) = &inputs.click {
