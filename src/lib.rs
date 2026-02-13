@@ -61,7 +61,7 @@ tracy_client::register_demangler!();
 
 macro_rules! atomic_float {
     ($name:ident, $float:ty, $atomic:ty) => {
-        #[derive(Default)]
+        #[derive(Default, Debug)]
         struct $name($atomic);
 
         impl $name {

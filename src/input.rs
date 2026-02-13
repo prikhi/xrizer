@@ -481,12 +481,56 @@ impl<C: openxr_data::Compositor> vr::IVRInput010_Interface for Input<C> {
         amplitude: f32,
         restrict_to_device: vr::VRInputValueHandle_t,
     ) -> vr::EVRInputError {
-        get_action_from_handle!(self, action, session_data, action);
+        /* Temp Stub for Logging get_action_from_handle! macro */
+        let session_data = self.openxr.session_data.get();
+        let action_getter = || {
+            let Some(loaded) = session_data.input_data.get_loaded_actions() else {
+                return Err(vr::EVRInputError::InvalidHandle);
+            };
+
+            loaded.try_get_action(action)
+        };
+        let action = match action_getter() {
+            Ok(action) => action,
+            Err(e) => {
+                trace!("Could not get action from handle: {e:?}");
+                return e;
+            }
+        };
+        // End Stub
+        // get_action_from_handle!(self, action, session_data, action);
         let Some(subaction_path) = self.subaction_path_from_handle(restrict_to_device) else {
+            trace!("No subaction path for handle: {restrict_to_device}");
             return vr::EVRInputError::None;
         };
 
         let ActionData::Haptic(action) = action else {
+            /* Temp Stub for Logging */
+            match action {
+                ActionData::Bool(action) => trace!(
+                    "Bool action instead of haptic, {:?} - {:?}",
+                    action.as_raw(),
+                    action.state(&session_data.session, subaction_path),
+                ),
+                ActionData::Vector1 { action, last_value } => trace!(
+                    "Vector1 action instead of haptic, {:?} - {:?} - {last_value:?}",
+                    action.as_raw(),
+                    action.state(&session_data.session, subaction_path),
+                ),
+
+                ActionData::Vector2 { action, last_value } => trace!(
+                    "Vector2 action instead of haptic, {:?} - {:?} - {last_value:?}",
+                    action.as_raw(),
+                    action.state(&session_data.session, subaction_path),
+                ),
+                ActionData::Pose => trace!("Pose action instead of haptic"),
+                ActionData::Skeleton {
+                    hand,
+                    hand_tracker: _,
+                } => trace!("Skeleton action instead of haptic, {hand:?}"),
+                ActionData::Haptic(_) => (),
+            }
+            // End Stub
             return vr::EVRInputError::WrongType;
         };
 
@@ -494,6 +538,9 @@ impl<C: openxr_data::Compositor> vr::IVRInput010_Interface for Input<C> {
             warn!("start_seconds_from_now: {start_seconds_from_now}")
         }
 
+        trace!(
+            "Applying Feedback on {subaction_path:?}. F: {frequency}, A: {amplitude}, D: {duration_seconds}s"
+        );
         action
             .apply_feedback(
                 &session_data.session,
