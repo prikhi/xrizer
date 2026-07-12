@@ -1,7 +1,6 @@
 use crate::{
     clientcore::{Injected, Injector},
-    graphics_backends::{supported_apis_enum, GraphicsBackend, VulkanData},
-    input::{InteractionProfile, Profiles},
+    graphics_backends::{GraphicsBackend, VulkanData, supported_apis_enum},
 };
 use derive_more::Deref;
 use glam::f32::{Quat, Vec3};
@@ -10,9 +9,13 @@ use openvr as vr;
 use openxr as xr;
 use std::mem::ManuallyDrop;
 use std::sync::{
-    atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
-    Mutex, RwLock,
+    RwLock,
+    atomic::{AtomicI64, Ordering},
 };
+use std::time::Duration;
+
+#[cfg(feature = "monado")]
+use openxr_mndx_xdev_space::XR_MNDX_XDEV_SPACE_EXTENSION_NAME;
 
 pub trait Compositor: vr::InterfaceImpl {
     fn post_session_restart(
@@ -38,8 +41,7 @@ pub struct OpenXrData<C: Compositor> {
     pub system_id: xr::SystemId,
     pub session_data: SessionReadGuard,
     pub display_time: AtomicXrTime,
-    pub left_hand: HandInfo,
-    pub right_hand: HandInfo,
+    pub display_period_nanos: AtomicI64,
     pub enabled_extensions: xr::ExtensionSet,
 
     /// should only be externally accessed for testing
@@ -70,10 +72,47 @@ impl From<SessionCreationError> for InitError {
     }
 }
 
+fn get_app_name() -> Option<String> {
+    let exe = std::fs::read_link("/proc/self/exe")
+        .inspect_err(|e| warn!("Couldn't get app name from /proc/self/exe: {e}"))
+        .ok()?;
+
+    let basename = exe.file_name().unwrap();
+    if basename == "wine64-preloader" || basename == "wine-preloader" {
+        fn extract_wine_exe_name() -> Option<String> {
+            let exe_path = std::env::args().next()?;
+            // The Windows path separator is \ (instead of /) so we can't use Path.
+            // We just want the basename anyway, so we'll just grab the last piece.
+            let exe_name = exe_path.rsplit_once('\\')?.1;
+            Some(
+                exe_name
+                    .strip_suffix(".exe")
+                    .unwrap_or(exe_name)
+                    .to_string(),
+            )
+        }
+        if let Some(name) = extract_wine_exe_name() {
+            return Some(name);
+        }
+    }
+
+    Some(basename.to_string_lossy().into_owned())
+}
+
+fn make_version() -> u32 {
+    env!("CARGO_PKG_VERSION_MAJOR").parse::<u32>().unwrap_or(0) * 1000000
+        + env!("CARGO_PKG_VERSION_MINOR").parse::<u32>().unwrap_or(0) * 1000
+        + env!("CARGO_PKG_VERSION_PATCH").parse::<u32>().unwrap_or(1)
+}
+
 impl<C: Compositor> OpenXrData<C> {
     pub fn new(injector: &Injector) -> Result<Self, InitError> {
-        #[cfg(not(test))]
+        #[cfg(all(not(test), feature = "static-openxr"))]
         let entry = xr::Entry::linked();
+
+        #[cfg(all(not(test), not(feature = "static-openxr")))]
+        let entry = unsafe { xr::Entry::load() }
+            .expect("Failed to load OpenXR loader — is libopenxr-loader installed?");
 
         #[cfg(test)]
         let entry =
@@ -86,18 +125,35 @@ impl<C: Compositor> OpenXrData<C> {
         let mut exts = xr::ExtensionSet::default();
         exts.khr_vulkan_enable = supported_exts.khr_vulkan_enable;
         exts.khr_opengl_enable = supported_exts.khr_opengl_enable;
+        exts.khr_convert_timespec_time = supported_exts.khr_convert_timespec_time;
         exts.ext_hand_tracking = supported_exts.ext_hand_tracking;
         exts.khr_visibility_mask = supported_exts.khr_visibility_mask;
         exts.khr_composition_layer_cylinder = supported_exts.khr_composition_layer_cylinder;
         exts.khr_composition_layer_equirect2 = supported_exts.khr_composition_layer_equirect2;
         exts.khr_composition_layer_color_scale_bias =
             supported_exts.khr_composition_layer_color_scale_bias;
+        exts.htc_vive_focus3_controller_interaction =
+            supported_exts.htc_vive_focus3_controller_interaction;
+        exts.fb_display_refresh_rate = supported_exts.fb_display_refresh_rate;
+
+        // Extension that enables simple full body tracking support via generic tracked devices.
+        // Available only in the Monado OpenXR runtime.
+        #[cfg(feature = "monado")]
+        if supported_exts
+            .other
+            .contains(&XR_MNDX_XDEV_SPACE_EXTENSION_NAME.to_string())
+        {
+            exts.other
+                .push(XR_MNDX_XDEV_SPACE_EXTENSION_NAME.to_string());
+        }
 
         let instance = entry
             .create_instance(
                 &xr::ApplicationInfo {
-                    application_name: "XRizer",
+                    application_name: get_app_name().as_deref().unwrap_or("XRizer"),
                     application_version: 0,
+                    engine_name: "XRizer",
+                    engine_version: make_version(),
                     ..Default::default()
                 },
                 &exts,
@@ -119,17 +175,19 @@ impl<C: Compositor> OpenXrData<C> {
             .0,
         )));
 
-        let left_hand = HandInfo::new(&instance, "/user/hand/left");
-        let right_hand = HandInfo::new(&instance, "/user/hand/right");
+        let display_time = if exts.khr_convert_timespec_time {
+            instance.now().map(|t| t.as_nanos()).unwrap_or(1i64)
+        } else {
+            1i64
+        };
 
         Ok(Self {
             _entry: entry,
             instance,
             system_id,
             session_data,
-            display_time: AtomicXrTime(1.into()),
-            left_hand,
-            right_hand,
+            display_time: AtomicXrTime(display_time.into()), // This will get replaced on the first WaitGetPoses
+            display_period_nanos: 11111111.into(), // This will get replaced on the first WaitGetPoses
             enabled_extensions: exts,
             input: injector.inject(),
             compositor: injector.inject(),
@@ -154,32 +212,8 @@ impl<C: Compositor> OpenXrData<C> {
                     info!("OpenXR session state changed: {:?}", event.state());
                 }
                 xr::Event::InteractionProfileChanged(_) => {
-                    for info in [&self.left_hand, &self.right_hand] {
-                        let profile_path = session_data
-                            .session
-                            .current_interaction_profile(info.subaction_path)
-                            .unwrap();
-
-                        info.profile_path.store(profile_path);
-                        let profile = match profile_path {
-                            xr::Path::NULL => {
-                                info.connected.store(false, Ordering::Relaxed);
-                                "<null>".to_owned()
-                            }
-                            path => {
-                                info.connected.store(true, Ordering::Relaxed);
-                                self.instance.path_to_string(path).unwrap()
-                            }
-                        };
-
-                        *info.profile.lock().unwrap() = Profiles::get().profile_from_name(&profile);
-
-                        session_data.input_data.interaction_profile_changed();
-
-                        info!(
-                            "{} interaction profile changed: {}",
-                            info.path_name, profile
-                        );
+                    if let Some(input) = self.input.get() {
+                        input.interaction_profile_changed(session_data);
                     }
                 }
                 _ => {
@@ -253,7 +287,10 @@ impl<C: Compositor> OpenXrData<C> {
                 Quat::from_xyzw(orientation.x, orientation.y, orientation.z, orientation.w),
                 Vec3::Y,
             )
-            .unwrap();
+            .unwrap_or_else(|| {
+                warn!("Couldn't decompose rotation - using identity");
+                (Quat::IDENTITY, Quat::IDENTITY)
+            });
 
             *adjusted_space = session
                 .create_reference_space(
@@ -272,7 +309,9 @@ impl<C: Compositor> OpenXrData<C> {
         };
 
         match origin {
-            vr::ETrackingUniverseOrigin::RawAndUncalibrated => unimplemented!(),
+            vr::ETrackingUniverseOrigin::RawAndUncalibrated => {
+                // RawAndUncalibrated has no calibration to reset
+            }
             vr::ETrackingUniverseOrigin::Standing => reset_space(
                 stage_space_reference,
                 stage_space_adjusted,
@@ -284,6 +323,27 @@ impl<C: Compositor> OpenXrData<C> {
                 xr::ReferenceSpaceType::LOCAL,
             ),
         };
+    }
+
+    pub fn get_refresh_rate(&self) -> f32 {
+        let get_fallback_rate = || {
+            Duration::from_nanos(
+                self.display_period_nanos
+                    .load(Ordering::Relaxed)
+                    .try_into()
+                    .unwrap(),
+            )
+            .as_secs_f32()
+        };
+        if !self.enabled_extensions.fb_display_refresh_rate {
+            return get_fallback_rate();
+        }
+
+        self.session_data
+            .get()
+            .session
+            .get_display_refresh_rate()
+            .unwrap_or_else(|_| get_fallback_rate())
     }
 
     fn end_session(&self, session_data: &mut SessionData) {
@@ -333,6 +393,16 @@ pub struct Session<G: xr::Graphics> {
     swapchain_formats: Vec<G::Format>,
 }
 supported_apis_enum!(pub enum GraphicalSession: Session);
+impl std::fmt::Display for GraphicalSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GraphicalSession::Vulkan(_) => f.write_str("GraphicalSession::Vulkan"),
+            GraphicalSession::OpenGL(_) => f.write_str("GraphicalSession::OpenGL"),
+            #[cfg(test)]
+            GraphicalSession::Fake(_) => f.write_str("GraphicalSession::Fake"),
+        }
+    }
+}
 supported_apis_enum!(pub enum FrameStream: xr::FrameStream);
 
 // Implementing From results in a "conflicting implementations" error: https://github.com/rust-lang/rust/issues/85576
@@ -474,10 +544,9 @@ impl SessionData {
             if let Some(xr::Event::SessionStateChanged(state)) = instance
                 .poll_event(&mut buf)
                 .map_err(SessionCreationError::PollEventFailed)?
+                && state.state() == xr::SessionState::READY
             {
-                if state.state() == xr::SessionState::READY {
-                    break;
-                }
+                break;
             }
         }
 
@@ -537,10 +606,11 @@ impl SessionData {
     {
         let formats = &(&self.session_graphics)
             .try_into()
-            .unwrap_or_else(|e| {
+            .unwrap_or_else(|_| {
                 panic!(
-                    "Session was not using API {}: {e}",
-                    std::any::type_name::<G>()
+                    "Expected session API {}, but current session is using {}!",
+                    std::any::type_name::<G>(),
+                    self.session_graphics,
                 )
             })
             .swapchain_formats;
@@ -565,7 +635,10 @@ impl SessionData {
         match origin {
             vr::ETrackingUniverseOrigin::Seated => &self.local_space_adjusted,
             vr::ETrackingUniverseOrigin::Standing => &self.stage_space_adjusted,
-            vr::ETrackingUniverseOrigin::RawAndUncalibrated => unreachable!(),
+            vr::ETrackingUniverseOrigin::RawAndUncalibrated => {
+                crate::warn_unimplemented!("RawAndUncalibrated tracking space");
+                &self.stage_space_reference
+            }
         }
     }
 
@@ -584,7 +657,10 @@ impl SessionData {
         match self.current_origin {
             vr::ETrackingUniverseOrigin::Seated => xr::ReferenceSpaceType::LOCAL,
             vr::ETrackingUniverseOrigin::Standing => xr::ReferenceSpaceType::STAGE,
-            vr::ETrackingUniverseOrigin::RawAndUncalibrated => unreachable!(),
+            vr::ETrackingUniverseOrigin::RawAndUncalibrated => {
+                crate::warn_unimplemented!("RawAndUncalibrated tracking space");
+                xr::ReferenceSpaceType::STAGE
+            }
         }
     }
 
@@ -595,57 +671,39 @@ impl SessionData {
     }
 }
 
-pub struct AtomicPath(AtomicU64);
-impl AtomicPath {
-    pub(crate) fn load(&self) -> xr::Path {
-        xr::Path::from_raw(self.0.load(Ordering::Relaxed))
-    }
-
-    fn store(&self, path: xr::Path) {
-        self.0.store(path.into_raw(), Ordering::Relaxed);
-    }
-}
-
-pub struct HandInfo {
-    path_name: &'static str,
-    connected: AtomicBool,
-    pub subaction_path: xr::Path,
-    pub profile_path: AtomicPath,
-    pub profile: Mutex<Option<&'static dyn InteractionProfile>>,
-}
-
-impl HandInfo {
-    #[inline]
-    pub fn connected(&self) -> bool {
-        self.connected.load(Ordering::Relaxed)
-    }
-
-    fn new(instance: &xr::Instance, path_name: &'static str) -> Self {
-        Self {
-            path_name,
-            connected: false.into(),
-            subaction_path: instance.string_to_path(path_name).unwrap(),
-            profile_path: AtomicPath(0.into()),
-            profile: Mutex::default(),
-        }
-    }
-}
-
 #[repr(u32)]
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Hand {
     Left = 1,
     Right,
 }
 
-impl TryFrom<vr::TrackedDeviceIndex_t> for Hand {
+impl TryFrom<vr::ETrackedControllerRole> for Hand {
     type Error = ();
     #[inline]
-    fn try_from(value: vr::TrackedDeviceIndex_t) -> Result<Self, Self::Error> {
+    fn try_from(value: vr::ETrackedControllerRole) -> Result<Self, Self::Error> {
         match value {
-            x if x == Hand::Left as u32 => Ok(Hand::Left),
-            x if x == Hand::Right as u32 => Ok(Hand::Right),
+            vr::ETrackedControllerRole::LeftHand => Ok(Hand::Left),
+            vr::ETrackedControllerRole::RightHand => Ok(Hand::Right),
             _ => Err(()),
+        }
+    }
+}
+
+impl From<Hand> for vr::ETrackedControllerRole {
+    fn from(hand: Hand) -> Self {
+        match hand {
+            Hand::Left => vr::ETrackedControllerRole::LeftHand,
+            Hand::Right => vr::ETrackedControllerRole::RightHand,
+        }
+    }
+}
+
+impl From<Hand> for xr::HandEXT {
+    fn from(hand: Hand) -> Self {
+        match hand {
+            Hand::Left => xr::HandEXT::LEFT,
+            Hand::Right => xr::HandEXT::RIGHT,
         }
     }
 }

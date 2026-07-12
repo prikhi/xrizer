@@ -21,8 +21,8 @@ use openvr::{
 use log::{debug, error, info, warn};
 use serde::Deserialize;
 use std::any::{Any, TypeId};
-use std::collections::{hash_map::Entry, HashMap};
-use std::ffi::{c_char, c_void, CStr, CString};
+use std::collections::{HashMap, hash_map::Entry};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock, Weak};
 
 type ErasedInterface = dyn Any + Sync + Send;
@@ -156,6 +156,17 @@ impl IVRClientCore003_Interface for ClientCore {
                 }
             })
             .flatten();
+
+        if let Some(data) = self.openxr.read().unwrap().as_ref() {
+            warn!("ClientCore::Init already called");
+            if let Some(path) = manifest_path {
+                data.input
+                    .force(|_| Input::new(data.clone()))
+                    .SetActionManifestPath(path.as_ptr());
+            }
+
+            return vr::EVRInitError::None;
+        }
 
         match OpenXrData::new(&Injector {
             store: self.interface_store.clone(),

@@ -1,8 +1,9 @@
 #[path = "skeletal_generated.rs"]
-mod gen;
+mod generated;
 
 use super::Input;
-use crate::openxr_data::{self, Hand, OpenXrData, SessionData};
+use crate::openxr_data::{self, Hand, SessionData};
+use HandSkeletonBone::*;
 use glam::{Affine3A, Quat, Vec3};
 use log::debug;
 use openvr as vr;
@@ -11,33 +12,35 @@ use paste::paste;
 use std::cell::RefCell;
 use std::f32::consts::{FRAC_PI_2, PI};
 use std::time::Instant;
-use HandSkeletonBone::*;
 
 impl<C: openxr_data::Compositor> Input<C> {
-    /// Returns false if hand tracking data couldn't be generated for some reason.
     pub(super) fn get_bones_from_hand_tracking(
         &self,
-        xr_data: &OpenXrData<C>,
         session_data: &SessionData,
         space: vr::EVRSkeletalTransformSpace,
-        hand_tracker: &xr::HandTracker,
         hand: Hand,
         transforms: &mut [vr::VRBoneTransform_t],
     ) {
         use HandSkeletonBone::*;
 
         let pose_data = session_data.input_data.pose_data.get().unwrap();
-        let display_time = self.openxr.display_time.get();
-        let Some(raw) = match hand {
-            Hand::Left => &pose_data.left_space,
-            Hand::Right => &pose_data.right_space,
-        }
-        .try_get_or_init_raw(xr_data, session_data, pose_data) else {
+        let devices = session_data.input_data.devices.read().unwrap();
+
+        let Some(controller) = devices.get_controller(hand) else {
             self.get_estimated_bones(session_data, space, hand, transforms);
             return;
         };
 
-        let Some(joints) = raw.locate_hand_joints(hand_tracker, display_time).unwrap() else {
+        let Some(raw) = match hand {
+            Hand::Left => &pose_data.left_space,
+            Hand::Right => &pose_data.right_space,
+        }
+        .try_get_or_init_raw(&controller.profile_data, session_data, pose_data) else {
+            self.get_estimated_bones(session_data, space, hand, transforms);
+            return;
+        };
+
+        let Some(joints) = controller.get_hand_skeleton(&self.openxr, &raw) else {
             self.get_estimated_bones(session_data, space, hand, transforms);
             return;
         };
@@ -159,6 +162,122 @@ impl<C: openxr_data::Compositor> Input<C> {
         *self.skeletal_tracking_level.write().unwrap() = vr::EVRSkeletalTrackingLevel::Full;
     }
 
+    pub(super) fn get_bone_summary_from_hand_tracking(
+        &self,
+        session_data: &SessionData,
+        summary_type: vr::EVRSummaryType,
+        summary_data: &mut vr::VRSkeletalSummaryData_t,
+        hand: Hand,
+    ) {
+        let pose_data = session_data.input_data.pose_data.get().unwrap();
+        let devices = session_data.input_data.devices.read().unwrap();
+
+        let Some(controller) = devices.get_controller(hand) else {
+            self.get_estimated_bone_summary(session_data, summary_type, summary_data, hand);
+            return;
+        };
+
+        let Some(raw) = match hand {
+            Hand::Left => &pose_data.left_space,
+            Hand::Right => &pose_data.right_space,
+        }
+        .try_get_or_init_raw(&controller.profile_data, session_data, pose_data) else {
+            self.get_estimated_bone_summary(session_data, summary_type, summary_data, hand);
+            return;
+        };
+
+        let Some(joints) = controller.get_hand_skeleton(&self.openxr, &raw) else {
+            self.get_estimated_bone_summary(session_data, summary_type, summary_data, hand);
+            return;
+        };
+
+        let joints: Box<[_]> = joints
+            .into_iter()
+            .map(|joint_location| {
+                let position = joint_location.pose.position;
+                let orientation = joint_location.pose.orientation;
+                (
+                    Vec3::from_array([position.x, position.y, position.z]),
+                    Quat::from_xyzw(orientation.x, orientation.y, orientation.z, orientation.w),
+                )
+            })
+            .collect();
+
+        // FIXME: calculate splay
+        summary_data.flFingerSplay.fill(0.2);
+
+        for (i, out_curl) in summary_data.flFingerCurl.iter_mut().enumerate() {
+            if i == 0
+                && controller
+                    .profile_data
+                    .as_ref()
+                    .is_some_and(|p| p.force_estimated_thumb)
+            {
+                *out_curl = self.get_finger_state(session_data, hand).thumb;
+                continue;
+            }
+
+            let (metacarpal, proximal, tip) = match i {
+                0 => (
+                    joints[xr::HandJoint::THUMB_METACARPAL],
+                    joints[xr::HandJoint::THUMB_PROXIMAL],
+                    joints[xr::HandJoint::THUMB_TIP],
+                ),
+                1 => (
+                    joints[xr::HandJoint::INDEX_METACARPAL],
+                    joints[xr::HandJoint::INDEX_PROXIMAL],
+                    joints[xr::HandJoint::INDEX_TIP],
+                ),
+                2 => (
+                    joints[xr::HandJoint::MIDDLE_METACARPAL],
+                    joints[xr::HandJoint::MIDDLE_PROXIMAL],
+                    joints[xr::HandJoint::MIDDLE_TIP],
+                ),
+                3 => (
+                    joints[xr::HandJoint::RING_METACARPAL],
+                    joints[xr::HandJoint::RING_PROXIMAL],
+                    joints[xr::HandJoint::RING_TIP],
+                ),
+                4 => (
+                    joints[xr::HandJoint::LITTLE_METACARPAL],
+                    joints[xr::HandJoint::LITTLE_PROXIMAL],
+                    joints[xr::HandJoint::LITTLE_TIP],
+                ),
+                _ => unreachable!(),
+            };
+
+            // Vector pointing from the knuckle to the metacarpal
+            let proximal_metacarpal_delta = metacarpal.0 - proximal.0;
+            // Vector pointing from the knuckle to the tip of the finger
+            let tip_proximal_delta = tip.0 - proximal.0;
+
+            // The dotproduct will give us the angle between the two vectors
+            let dot = proximal_metacarpal_delta.dot(tip_proximal_delta);
+            let a = proximal_metacarpal_delta.length();
+            let b = tip_proximal_delta.length();
+
+            let curl = if a == 0.0 || b == 0.0 {
+                // If the joints converge, say the finger is fully curled
+                1.0
+            } else {
+                // Isolate cos(angle)
+                let ang_cos = (dot / (a * b)).clamp(-1.0, 1.0);
+                // Convert the angle to radians
+                let ang = ang_cos.acos();
+
+                // When the finger is straight, the angle is 180deg (PI radians)
+                // When the finger is fully curled, the angle is (theoretically) 0
+                1.0 - (ang / PI)
+            };
+
+            // But in the real world, when a finger is curled, an angle of 0 is physically
+            // not possible. The curl maxes out at around 0.8, give or take some depending on
+            // the user's hands. Remap the value so >=0.8 (arbitrary value) means fully curled
+            const MAX_CURL: f32 = 0.8;
+            *out_curl = (curl / MAX_CURL).clamp(0.0, 1.0);
+        }
+    }
+
     pub(super) fn get_estimated_bones(
         &self,
         session_data: &SessionData,
@@ -168,8 +287,11 @@ impl<C: openxr_data::Compositor> Input<C> {
     ) {
         let finger_state = self.get_finger_state(session_data, hand);
         let (open, fist) = match hand {
-            Hand::Left => (&gen::left_hand::OPENHAND, &gen::left_hand::FIST),
-            Hand::Right => (&gen::right_hand::OPENHAND, &gen::right_hand::FIST),
+            Hand::Left => (&generated::left_hand::OPENHAND, &generated::left_hand::FIST),
+            Hand::Right => (
+                &generated::right_hand::OPENHAND,
+                &generated::right_hand::FIST,
+            ),
         };
 
         const fn constrain<'a, F, G>(f: F) -> F
@@ -203,6 +325,27 @@ impl<C: openxr_data::Compositor> Input<C> {
         *self.skeletal_tracking_level.write().unwrap() = vr::EVRSkeletalTrackingLevel::Estimated;
     }
 
+    pub(super) fn get_estimated_bone_summary(
+        &self,
+        session_data: &SessionData,
+        _: vr::EVRSummaryType,
+        summary_data: &mut vr::VRSkeletalSummaryData_t,
+        hand: Hand,
+    ) {
+        let state = self.get_finger_state(session_data, hand);
+
+        *summary_data = vr::VRSkeletalSummaryData_t {
+            flFingerSplay: [0.2; 4],
+            flFingerCurl: [
+                state.thumb,
+                state.index,
+                state.middle,
+                state.ring,
+                state.pinky,
+            ],
+        };
+    }
+
     fn get_finger_state(&self, session_data: &SessionData, hand: Hand) -> FingerState {
         // Determines the speed at which fingers follow the input states
         // This value seems to feel right for both analog inputs and binary ones (like vive wands)
@@ -214,10 +357,8 @@ impl<C: openxr_data::Compositor> Input<C> {
             .get()
             .unwrap()
             .actions;
-        let subaction = match hand {
-            Hand::Left => self.openxr.left_hand.subaction_path,
-            Hand::Right => self.openxr.right_hand.subaction_path,
-        };
+
+        let subaction = self.get_subaction_path(hand);
 
         let thumb_touch = actions
             .thumb_touch
@@ -282,16 +423,16 @@ impl<C: openxr_data::Compositor> Input<C> {
     ) {
         let skeleton = match hand {
             Hand::Left => match pose {
-                vr::EVRSkeletalReferencePose::BindPose => &gen::left_hand::BINDPOSE,
-                vr::EVRSkeletalReferencePose::OpenHand => &gen::left_hand::OPENHAND,
-                vr::EVRSkeletalReferencePose::Fist => &gen::left_hand::FIST,
-                vr::EVRSkeletalReferencePose::GripLimit => &gen::left_hand::GRIPLIMIT,
+                vr::EVRSkeletalReferencePose::BindPose => &generated::left_hand::BINDPOSE,
+                vr::EVRSkeletalReferencePose::OpenHand => &generated::left_hand::OPENHAND,
+                vr::EVRSkeletalReferencePose::Fist => &generated::left_hand::FIST,
+                vr::EVRSkeletalReferencePose::GripLimit => &generated::left_hand::GRIPLIMIT,
             },
             Hand::Right => match pose {
-                vr::EVRSkeletalReferencePose::BindPose => &gen::right_hand::BINDPOSE,
-                vr::EVRSkeletalReferencePose::OpenHand => &gen::right_hand::OPENHAND,
-                vr::EVRSkeletalReferencePose::Fist => &gen::right_hand::FIST,
-                vr::EVRSkeletalReferencePose::GripLimit => &gen::right_hand::GRIPLIMIT,
+                vr::EVRSkeletalReferencePose::BindPose => &generated::right_hand::BINDPOSE,
+                vr::EVRSkeletalReferencePose::OpenHand => &generated::right_hand::OPENHAND,
+                vr::EVRSkeletalReferencePose::Fist => &generated::right_hand::FIST,
+                vr::EVRSkeletalReferencePose::GripLimit => &generated::right_hand::GRIPLIMIT,
             },
         };
 

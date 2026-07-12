@@ -108,17 +108,26 @@ pub trait WithAnyGraphicsOwned<G>: WithAnyGraphicsParams {
 }
 
 impl SupportedBackend {
-    pub fn new(texture: &vr::Texture_t, _bounds: vr::VRTextureBounds_t) -> Self {
+    pub fn is_texture_type_supported(texture_type: vr::ETextureType) -> bool {
+        match texture_type {
+            vr::ETextureType::Vulkan | vr::ETextureType::OpenGL => true,
+            #[cfg(test)]
+            vr::ETextureType::Reserved => true,
+            _ => false,
+        }
+    }
+
+    pub fn new(texture: &vr::Texture_t, _bounds: vr::VRTextureBounds_t) -> Option<Self> {
         match texture.eType {
             vr::ETextureType::Vulkan => {
                 let vk_texture = unsafe { &*(texture.handle as *const vr::VRVulkanTextureData_t) };
-                Self::Vulkan(VulkanData::new(vk_texture))
+                Some(Self::Vulkan(VulkanData::new(vk_texture)))
             }
-            vr::ETextureType::OpenGL => Self::OpenGL(GlData::new()),
+            vr::ETextureType::OpenGL => GlData::new().map(Self::OpenGL),
             #[cfg(test)]
-            vr::ETextureType::Reserved => {
-                Self::Fake(crate::compositor::FakeGraphicsData::new(texture))
-            }
+            vr::ETextureType::Reserved => Some(Self::Fake(
+                crate::compositor::FakeGraphicsData::new(texture),
+            )),
             other => panic!("Unsupported texture type: {other:?}"),
         }
     }

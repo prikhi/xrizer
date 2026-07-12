@@ -1,20 +1,21 @@
 use crate::{
+    AtomicF64,
     clientcore::{Injected, Injector},
-    graphics_backends::{supported_backends_enum, GraphicsBackend, SupportedBackend},
+    graphics_backends::{GraphicsBackend, SupportedBackend, supported_backends_enum},
     input::Input,
     openxr_data::{self, FrameStream, OpenXrData, SessionCreateInfo, SessionData},
     overlay::OverlayMan,
     system::System,
-    tracy_span, AtomicF64,
+    tracy_span,
 };
 
-use log::{debug, info, trace};
+use log::{debug, info, trace, warn};
 use openvr as vr;
 use openxr as xr;
 use std::mem::offset_of;
 use std::sync::{
-    atomic::{AtomicU32, Ordering},
     Arc, Mutex, Once,
+    atomic::{AtomicU32, Ordering},
 };
 use std::time::Instant;
 use std::{ffi::c_char, ops::Deref};
@@ -24,7 +25,9 @@ pub struct CompositorSessionData(Mutex<Option<DynFrameController>>);
 
 #[derive(macros::InterfaceImpl)]
 #[interface = "IVRCompositor"]
-#[versions(028, 027, 026, 022, 021, 020, 019, 018, 016, 009)]
+#[versions(
+    029, 028, 027, 026, 022, 021, 020, 019, 018, 016, 015, 014, 012, 011, 009
+)]
 pub struct Compositor {
     vtables: Vtables,
     openxr: Arc<OpenXrData<Self>>,
@@ -47,24 +50,20 @@ enum FrameState {
 }
 
 impl FrameState {
-    fn advance_to(&mut self, new: Self) {
+    fn advance_to(&mut self, new: Self) -> bool {
         let old = *self;
-        let mut allowed = |a| {
-            assert!(new == a, "Tried to advance from {:?} to {new:?}", *self);
-            *self = a;
+        let allowed: bool = match old {
+            Self::Waited => new == Self::Begun,
+            Self::Begun => new != Self::Begun,
+            Self::Submitted => new == Self::Waited,
         };
-
-        match old {
-            Self::Waited => {
-                allowed(Self::Begun);
-            }
-            Self::Begun => *self = new,
-            Self::Submitted => {
-                allowed(Self::Waited);
-            }
+        if allowed {
+            *self = new;
+            trace!("advanced frame state from {old:?} to {new:?}");
+        } else {
+            warn!("Tried to advance frame state from {old:?} to {new:?}, which is not allowed");
         }
-
-        trace!("advanced frame state from {old:?} to {new:?}");
+        allowed
     }
 }
 
@@ -113,22 +112,31 @@ impl Compositor {
         };
 
         #[macros::any_graphics(DynFrameController)]
-        fn wait_frame<G: GraphicsBackend + 'static>(ctrl: &mut FrameController<G>) -> xr::Time {
+        fn wait_frame<G: GraphicsBackend + 'static>(
+            ctrl: &mut FrameController<G>,
+        ) -> (xr::Time, i64) {
             ctrl.wait_frame()
         }
 
+        let (display_time, display_period) = ctrl.with_any_graphics_mut::<wait_frame>(());
+        self.openxr.display_time.set(display_time);
         self.openxr
-            .display_time
-            .set(ctrl.with_any_graphics_mut::<wait_frame>(()));
+            .display_period_nanos
+            .store(display_period, Ordering::Relaxed);
     }
 
     fn maybe_begin_frame(&self, session_data: &SessionData) {
         tracy_span!();
         let mut frame_lock = { session_data.comp_data.0.lock().unwrap() };
-        self.frame_state
+        if !self
+            .frame_state
             .lock()
             .unwrap()
-            .advance_to(FrameState::Begun);
+            .advance_to(FrameState::Begun)
+        {
+            debug!("not starting frame - already begun or submitted");
+            return;
+        };
         let Some(ctrl) = frame_lock.as_mut() else {
             debug!("no frame controller - not starting frame");
             return;
@@ -147,7 +155,8 @@ impl Compositor {
         texture: &vr::Texture_t,
         bounds: vr::VRTextureBounds_t,
     ) -> Result<(), vr::EVRCompositorError> {
-        let backend = SupportedBackend::new(texture, bounds);
+        let backend =
+            SupportedBackend::new(texture, bounds).ok_or(vr::EVRCompositorError::InvalidTexture)?;
 
         #[macros::any_graphics(SupportedBackend)]
         fn swapchain_info<G: GraphicsBackend>(
@@ -294,7 +303,7 @@ impl openxr_data::Compositor for Compositor {
 }
 
 #[allow(non_snake_case)]
-impl vr::IVRCompositor028_Interface for Compositor {
+impl vr::IVRCompositor029_Interface for Compositor {
     fn GetPosesForFrame(
         &self,
         _id: u32,
@@ -535,7 +544,7 @@ impl vr::IVRCompositor028_Interface for Compositor {
         }
 
         let textures = unsafe { std::slice::from_raw_parts(pTextures, unTextureCount as _) };
-        if let Err(e) = overlays.set_skybox(&self.openxr.session_data.get(), textures) {
+        if let Err(e) = overlays.set_skybox(textures) {
             e
         } else {
             vr::EVRCompositorError::None
@@ -632,7 +641,10 @@ impl vr::IVRCompositor028_Interface for Compositor {
             set!(m_flCompositorRenderCpuMs, 3.0);
             set!(m_flCompositorIdleCpuMs, 0.1);
 
-            set!(m_flClientFrameIntervalMs, 11.1);
+            set!(
+                m_flClientFrameIntervalMs,
+                1000.0 / self.openxr.get_refresh_rate()
+            );
             set!(m_flPresentCallCpuMs, 0.0);
             set!(m_flWaitForPresentCpuMs, 0.0);
             set!(m_flSubmitFrameMs, 0.0);
@@ -711,6 +723,19 @@ impl vr::IVRCompositor028_Interface for Compositor {
         _nSubmitFlags: vr::EVRSubmitFlags,
     ) -> vr::EVRCompositorError {
         todo!()
+    }
+
+    fn GetSubmitTexture(
+        &self,
+        _: *mut vr::Texture_t,
+        __bindgen_vtable: *mut bool,
+        _: vr::EVRCompositorTextureUsage,
+        _: *const vr::Texture_t,
+        _: *const vr::VRTextureBounds_t,
+        _: vr::EVRSubmitFlags,
+    ) -> vr::EVRCompositorError {
+        crate::warn_unimplemented!("GetSubmitTexture");
+        vr::EVRCompositorError::IncompatibleVersion
     }
 
     fn Submit(
@@ -802,11 +827,29 @@ impl vr::IVRCompositor028_Interface for Compositor {
 
     fn GetLastPoseForTrackedDeviceIndex(
         &self,
-        _unDeviceIndex: vr::TrackedDeviceIndex_t,
-        _pOutputPose: *mut vr::TrackedDevicePose_t,
-        _pOutputGamePose: *mut vr::TrackedDevicePose_t,
+        device_index: vr::TrackedDeviceIndex_t,
+        output_pose: *mut vr::TrackedDevicePose_t,
+        output_game_pose: *mut vr::TrackedDevicePose_t,
     ) -> vr::EVRCompositorError {
-        todo!()
+        if output_pose.is_null() && output_game_pose.is_null() {
+            return vr::EVRCompositorError::RequestFailed;
+        }
+
+        let input = self.input.force(|_| Input::new(self.openxr.clone()));
+
+        let Some(pose) = input.get_device_pose(device_index, None) else {
+            return vr::EVRCompositorError::RequestFailed;
+        };
+
+        if !output_pose.is_null() {
+            unsafe { output_pose.write(pose) };
+        }
+
+        if !output_game_pose.is_null() {
+            unsafe { output_game_pose.write(pose) };
+        }
+
+        vr::EVRCompositorError::None
     }
     fn GetLastPoses(
         &self,
@@ -919,7 +962,62 @@ impl vr::IVRCompositor016On018 for Compositor {
     }
 }
 
-impl vr::IVRCompositor009On016 for Compositor {
+impl vr::IVRCompositor015On016 for Compositor {
+    fn GetFrameTiming(
+        &self,
+        _timing: *mut openvr::vr_1_0_1::Compositor_FrameTiming,
+        _frames_ago: u32,
+    ) -> bool {
+        crate::warn_unimplemented!("GetFrameTiming (v1.0.1)");
+        false
+    }
+    fn RequestScreenshot(
+        &self,
+        _screenshot_type: vr::EVRScreenshotType,
+        _dest_file_name: *const std::ffi::c_char,
+        _vr_dest_file_name: *const std::ffi::c_char,
+    ) -> vr::EVRCompositorError {
+        todo!("RequestScreenshot (v1.0.1)");
+    }
+    fn GetCurrentScreenshotType(&self) -> vr::EVRScreenshotType {
+        todo!("GetCurrentScreenshotType (v1.0.1)");
+    }
+}
+
+impl vr::IVRCompositor014On015 for Compositor {
+    fn GetFrameTiming(
+        &self,
+        _timing: *mut vr::vr_0_9_20::Compositor_FrameTiming,
+        _frames_ago: u32,
+    ) -> bool {
+        crate::warn_unimplemented!("GetFrameTiming (v0.9.20)");
+        false
+    }
+}
+
+impl vr::IVRCompositor012On014 for Compositor {
+    fn GetFrameTiming(
+        &self,
+        _timing: *mut openvr::vr_0_9_17::Compositor_FrameTiming,
+        _frames_ago: u32,
+    ) -> bool {
+        crate::warn_unimplemented!("GetFrameTiming (v0.9.17)");
+        false
+    }
+}
+
+impl vr::IVRCompositor011On012 for Compositor {
+    fn GetFrameTiming(
+        &self,
+        _timing: *mut openvr::vr_0_9_15::Compositor_FrameTiming,
+        _frames_ago: u32,
+    ) -> bool {
+        crate::warn_unimplemented!("GetFrameTiming (v0.9.15)");
+        false
+    }
+}
+
+impl vr::IVRCompositor009On011 for Compositor {
     fn GetFrameTiming(
         &self,
         _timing: *mut vr::vr_0_9_12::Compositor_FrameTiming,
@@ -1089,13 +1187,16 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.image_acquired = true;
     }
 
-    fn wait_frame(&mut self) -> xr::Time {
+    fn wait_frame(&mut self) -> (xr::Time, i64) {
         let frame_state = {
             tracy_span!("wait frame");
             self.waiter.wait().unwrap()
         };
         self.should_render = frame_state.should_render && !self.app_suspend_render;
-        frame_state.predicted_display_time
+        (
+            frame_state.predicted_display_time,
+            frame_state.predicted_display_period.as_nanos(),
+        )
     }
 
     fn begin_frame(&mut self) {
@@ -1360,7 +1461,7 @@ mod tests {
             system: openxr::SystemId,
             info: &Self::SessionCreateInfo,
         ) -> openxr::Result<openxr::sys::Session> {
-            xr::Vulkan::create_session(instance, system, info)
+            unsafe { xr::Vulkan::create_session(instance, system, info) }
         }
 
         fn enumerate_swapchain_images(
@@ -1826,6 +1927,20 @@ mod tests {
         f.check_frame_state(fakexr::FrameState::Waited);
         assert_eq!(f.wait_get_poses(), None);
         f.check_frame_state(fakexr::FrameState::Waited);
+    }
+
+    #[test]
+    fn explicit_timing_multiple_submit_explicit_timing_data() {
+        let f = Fixture::new();
+        f.ensure_real_session(false);
+        f.comp.SetExplicitTimingMode(
+            vr::EVRCompositorTimingMode::Explicit_ApplicationPerformsPostPresentHandoff,
+        );
+
+        assert_eq!(f.comp.SubmitExplicitTimingData(), None);
+        f.check_frame_state(fakexr::FrameState::Begun);
+        assert_eq!(f.comp.SubmitExplicitTimingData(), None);
+        f.check_frame_state(fakexr::FrameState::Begun);
     }
 
     #[test]

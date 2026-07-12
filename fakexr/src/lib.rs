@@ -1,14 +1,19 @@
 pub mod vulkan;
+
+mod monado_xdev;
+pub use monado_xdev::add_trackers;
+
 use crossbeam_utils::atomic::AtomicCell;
 use glam::{Affine3A, Quat, Vec3};
 use openxr_sys as xr;
 use paste::paste;
 use slotmap::{DefaultKey, Key, KeyData, SlotMap};
 use std::collections::{HashMap, HashSet};
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{CStr, CString, c_char};
 use std::sync::{
+    Arc, LazyLock, Mutex, MutexGuard, OnceLock, RwLock, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
-    mpsc, Arc, LazyLock, Mutex, MutexGuard, OnceLock, RwLock, Weak,
+    mpsc,
 };
 
 #[derive(Clone, Copy, PartialEq)]
@@ -18,7 +23,8 @@ pub enum ActionState {
     Pose(bool),
     Float(f32),
     Vector2(f32, f32),
-    Haptic,
+    /// True if active
+    Haptic(bool),
 }
 
 impl From<bool> for ActionState {
@@ -58,6 +64,21 @@ pub fn set_action_state(action: xr::Action, state: ActionState, hand: UserPath) 
 pub fn deactivate_action(action: xr::Action) {
     let action = action.to_handle().unwrap();
     action.active.store(false, Ordering::Relaxed);
+}
+
+#[track_caller]
+pub fn is_haptic_activated(action: xr::Action, hand: UserPath) -> bool {
+    println!("{}", action.into_raw());
+    let action = action.to_handle().unwrap();
+    let instance = action.instance.upgrade().expect("Failed to get instance");
+
+    let hand_key = instance.string_to_path.lock().unwrap()[hand.as_path()];
+    let path = xr::Path::from_raw(hand_key.data().as_ffi());
+    let ActionState::Haptic(state) = action.get_hand_state(path).state else {
+        panic!("Wrong action type!");
+    };
+
+    state
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]
@@ -105,6 +126,14 @@ pub fn set_grip(session: xr::Session, path: UserPath, pose: xr::Posef) {
 pub fn set_aim(session: xr::Session, path: UserPath, pose: xr::Posef) {
     let session = session.to_handle().unwrap();
     get_hand_data(path, &session).aim_pose.store(pose);
+}
+
+#[track_caller]
+pub fn check_no_suggested_bindings(action: xr::Action, profile: xr::Path) -> bool {
+    let action = xr::Action::to_handle(action).unwrap();
+    let suggested = action.suggested.lock().unwrap();
+
+    suggested.get(&profile).is_none()
 }
 
 #[track_caller]
@@ -170,6 +199,21 @@ pub unsafe extern "system" fn get_instance_proc_addr(
         ([$($func:tt),+] $pat:pat => $expr:expr) => {
             get_fn!(@arm [$($func),+] -> [] {$pat => $expr})
         };
+        (@arm [ {mndx::$name:ident} $(,$rest:tt)* ] -> [$($arms:tt),*] {$pat:pat => $expr:expr}) => {
+            get_fn!(
+                @arm
+                [$($rest),*] ->
+                [
+                    $($arms,)*
+                    [
+                        x if x == const {
+                            CStr::from_bytes_with_nul_unchecked(concat!("xr", stringify!($name), "\0").as_bytes())
+                        } => Some(std::mem::transmute( paste! { monado_xdev::[<$name:snake>] as openxr_mndx_xdev_space::bindings::$name }))
+                    ]
+                ]
+                {$pat => $expr}
+            )
+        };
         (@arm [$name:ident $(,$rest:tt)*] -> [$($arms:tt),*] {$pat:pat => $expr:expr}) => {
             get_fn!(
                 @arm
@@ -221,74 +265,82 @@ pub unsafe extern "system" fn get_instance_proc_addr(
         use vulkan::xr::*;
 
         unsafe {
-            *function = get_fn![[
-                GetInstanceProcAddr,
-                CreateInstance,
-                DestroyInstance,
-                (EnumerateInstanceExtensionProperties),
-                (EnumerateApiLayerProperties),
-                GetVulkanInstanceExtensionsKHR,
-                GetVulkanDeviceExtensionsKHR,
-                GetVulkanGraphicsDeviceKHR,
-                GetVulkanGraphicsRequirementsKHR,
-                GetSystem,
-                CreateSession,
-                DestroySession,
-                BeginSession,
-                EndSession,
-                CreateReferenceSpace,
-                PollEvent,
-                DestroySpace,
-                LocateViews,
-                RequestExitSession,
-                (ResultToString),
-                (StructureTypeToString),
-                (GetInstanceProperties),
-                (GetSystemProperties),
-                CreateSwapchain,
-                DestroySwapchain,
-                EnumerateSwapchainImages,
-                AcquireSwapchainImage,
-                WaitSwapchainImage,
-                ReleaseSwapchainImage,
-                EnumerateSwapchainFormats,
-                (EnumerateReferenceSpaces),
-                CreateActionSpace,
-                LocateSpace,
-                (EnumerateViewConfigurations),
-                (EnumerateEnvironmentBlendModes),
-                (GetViewConfigurationProperties),
-                (EnumerateViewConfigurationViews),
-                BeginFrame,
-                EndFrame,
-                WaitFrame,
-                (ApplyHapticFeedback),
-                (StopHapticFeedback),
-                (PollEvent),
-                StringToPath,
-                PathToString,
-                (GetReferenceSpaceBoundsRect),
-                GetActionStateBoolean,
-                GetActionStateFloat,
-                GetActionStateVector2f,
-                (GetActionStatePose),
-                CreateActionSet,
-                DestroyActionSet,
-                CreateAction,
-                DestroyAction,
-                SuggestInteractionProfileBindings,
-                AttachSessionActionSets,
-                GetCurrentInteractionProfile,
-                SyncActions,
-                (EnumerateBoundSourcesForAction),
-                (GetInputSourceLocalizedName)
-                ]
+            {
+                *function = get_fn![[
+                    GetInstanceProcAddr,
+                    CreateInstance,
+                    DestroyInstance,
+                    (EnumerateInstanceExtensionProperties),
+                    (EnumerateApiLayerProperties),
+                    GetVulkanInstanceExtensionsKHR,
+                    GetVulkanDeviceExtensionsKHR,
+                    GetVulkanGraphicsDeviceKHR,
+                    GetVulkanGraphicsRequirementsKHR,
+                    GetSystem,
+                    CreateSession,
+                    DestroySession,
+                    BeginSession,
+                    EndSession,
+                    CreateReferenceSpace,
+                    PollEvent,
+                    DestroySpace,
+                    LocateViews,
+                    RequestExitSession,
+                    (ResultToString),
+                    (StructureTypeToString),
+                    (GetInstanceProperties),
+                    (GetSystemProperties),
+                    CreateSwapchain,
+                    DestroySwapchain,
+                    EnumerateSwapchainImages,
+                    AcquireSwapchainImage,
+                    WaitSwapchainImage,
+                    ReleaseSwapchainImage,
+                    EnumerateSwapchainFormats,
+                    (EnumerateReferenceSpaces),
+                    CreateActionSpace,
+                    LocateSpace,
+                    (EnumerateViewConfigurations),
+                    (EnumerateEnvironmentBlendModes),
+                    (GetViewConfigurationProperties),
+                    (EnumerateViewConfigurationViews),
+                    BeginFrame,
+                    EndFrame,
+                    WaitFrame,
+                    ApplyHapticFeedback,
+                    (StopHapticFeedback),
+                    (PollEvent),
+                    StringToPath,
+                    PathToString,
+                    (GetReferenceSpaceBoundsRect),
+                    GetActionStateBoolean,
+                    GetActionStateFloat,
+                    GetActionStateVector2f,
+                    (GetActionStatePose),
+                    CreateActionSet,
+                    DestroyActionSet,
+                    CreateAction,
+                    DestroyAction,
+                    SuggestInteractionProfileBindings,
+                    AttachSessionActionSets,
+                    GetCurrentInteractionProfile,
+                    SyncActions,
+                    (EnumerateBoundSourcesForAction),
+                    (GetInputSourceLocalizedName),
+                    {mndx::CreateXDevListMNDX},
+                    {mndx::GetXDevListGenerationNumberMNDX},
+                    {mndx::EnumerateXDevsMNDX},
+                    {mndx::GetXDevPropertiesMNDX},
+                    {mndx::DestroyXDevListMNDX},
+                    {mndx::CreateXDevSpaceMNDX}
+                    ]
 
-                other => {
-                    println!("unknown func: {other:?}");
-                    return xr::Result::ERROR_FUNCTION_UNSUPPORTED;
-                }
-            ]
+                    other => {
+                        println!("unknown func: {other:?}");
+                        return xr::Result::ERROR_FUNCTION_UNSUPPORTED;
+                    }
+                ]
+            }
         }
     }
 
@@ -302,10 +354,11 @@ extern "system" fn enumerate_instance_extension_properties(
     properties: *mut xr::ExtensionProperties,
 ) -> xr::Result {
     assert!(layer_name.is_null());
-    unsafe { *property_count_output = 1 };
-    if property_capacity_input > 0 {
+    unsafe { *property_count_output = 3 };
+    if property_capacity_input >= 3 {
         let props =
             unsafe { std::slice::from_raw_parts_mut(properties, property_capacity_input as usize) };
+
         props[0] = xr::ExtensionProperties {
             ty: xr::ExtensionProperties::TYPE,
             next: std::ptr::null_mut(),
@@ -316,6 +369,28 @@ extern "system" fn enumerate_instance_extension_properties(
         let name =
             unsafe { std::slice::from_raw_parts(name.as_ptr() as *const c_char, name.len()) };
         props[0].extension_name[..name.len()].copy_from_slice(name);
+
+        props[1] = xr::ExtensionProperties {
+            ty: xr::ExtensionProperties::TYPE,
+            next: std::ptr::null_mut(),
+            extension_name: [0 as c_char; xr::MAX_EXTENSION_NAME_SIZE],
+            extension_version: 1,
+        };
+        let name = openxr_mndx_xdev_space::XR_MNDX_XDEV_SPACE_EXTENSION_NAME;
+        let name =
+            unsafe { std::slice::from_raw_parts(name.as_ptr() as *const c_char, name.len()) };
+        props[1].extension_name[..name.len()].copy_from_slice(name);
+
+        props[2] = xr::ExtensionProperties {
+            ty: xr::ExtensionProperties::TYPE,
+            next: std::ptr::null_mut(),
+            extension_name: [0 as c_char; xr::MAX_EXTENSION_NAME_SIZE],
+            extension_version: 1,
+        };
+        let name = xr::HTC_VIVE_FOCUS3_CONTROLLER_INTERACTION_EXTENSION_NAME;
+        let name =
+            unsafe { std::slice::from_raw_parts(name.as_ptr() as *const c_char, name.len()) };
+        props[2].extension_name[..name.len()].copy_from_slice(name);
     }
     xr::Result::SUCCESS
 }
@@ -334,7 +409,7 @@ trait XrType {
 
 macro_rules! get_handle {
     ($handle:expr) => {{
-        match <_ as XrType>::to_handle($handle) {
+        match <_ as crate::XrType>::to_handle($handle) {
             Some(handle) => handle,
             None => {
                 eprintln!("unknown handle for {} ({:?})", stringify!($handle), $handle);
@@ -343,32 +418,39 @@ macro_rules! get_handle {
         }
     }};
 }
+pub(crate) use get_handle;
 
 macro_rules! impl_handle {
     ($ty:ty, $xr_type:ty) => {
-        impl XrType for $xr_type {
+        impl crate::XrType for $xr_type {
             type Handle = $ty;
             const TO_RAW: fn(Self) -> u64 = <$xr_type>::into_raw;
             fn to_handle(self) -> Option<Arc<Self::Handle>> {
                 Self::Handle::instances()
-                    .get(DefaultKey::from(KeyData::from_ffi(self.into_raw())))
+                    .get(slotmap::DefaultKey::from(slotmap::KeyData::from_ffi(
+                        self.into_raw(),
+                    )))
                     .map(|i| Arc::clone(i))
             }
         }
         impl Handle for $ty {
             type XrType = $xr_type;
-            fn instances() -> MutexGuard<'static, SlotMap<DefaultKey, Arc<Self>>> {
-                static I: LazyLock<Mutex<SlotMap<DefaultKey, Arc<$ty>>>> =
-                    LazyLock::new(|| Mutex::default());
+            fn instances()
+            -> std::sync::MutexGuard<'static, slotmap::SlotMap<slotmap::DefaultKey, Arc<Self>>>
+            {
+                static I: std::sync::LazyLock<
+                    std::sync::Mutex<slotmap::SlotMap<slotmap::DefaultKey, Arc<$ty>>>,
+                > = std::sync::LazyLock::new(|| std::sync::Mutex::default());
                 I.lock().unwrap()
             }
             fn to_xr(self: Arc<Self>) -> $xr_type {
                 let key = Self::instances().insert(self);
-                <$xr_type>::from_raw(key.data().as_ffi())
+                <$xr_type>::from_raw(<_ as slotmap::Key>::data(&key).as_ffi())
             }
         }
     };
 }
+pub(crate) use impl_handle;
 
 struct EventDataBuffer {
     buffer: Vec<u8>,
@@ -381,6 +463,8 @@ struct Instance {
     paths: Mutex<SlotMap<DefaultKey, String>>,
     string_to_path: Mutex<HashMap<String, DefaultKey>>,
     action_sets: Mutex<HashSet<xr::ActionSet>>,
+    left_hand_key: DefaultKey,
+    right_hand_key: DefaultKey,
 }
 
 impl Instance {
@@ -443,6 +527,7 @@ struct Session {
     state_synced: AtomicBool,
     should_render: AtomicBool,
     frame_state: AtomicCell<FrameState>,
+    with_trackers: AtomicBool,
 }
 
 impl Session {
@@ -478,6 +563,23 @@ impl Session {
         spaces.insert(key);
 
         xr
+    }
+
+    fn get_action_if_attached(
+        &self,
+        info: *const xr::ActionStateGetInfo,
+    ) -> Option<(Arc<ActionSet>, Arc<Action>)> {
+        let sets = self.attached_sets.get()?;
+        let action = xr::Action::to_handle(unsafe { (*info).action })?;
+        sets.into_iter().find_map(|set| {
+            let set = xr::ActionSet::to_handle(*set)?;
+            for a in set.actions.get().unwrap() {
+                if Arc::as_ptr(a) == Arc::as_ptr(&action) {
+                    return Some((set, action.clone()));
+                }
+            }
+            None
+        })
     }
 }
 
@@ -552,7 +654,18 @@ impl Space {
             .ok_or(xr::Result::ERROR_SESSION_LOST)?;
 
         let SpaceType::Action { hand, action } = &self.ty else {
-            todo!()
+            let pose = xr::Posef::IDENTITY;
+            let mat = pose_to_mat(pose);
+            let offset = pose_to_mat(self.offset);
+
+            let ret = mat_to_pose(mat * offset);
+
+            return Ok(xr::SpaceLocation {
+                ty: xr::SpaceLocation::TYPE,
+                next: std::ptr::null_mut(),
+                location_flags: *LOCATION_FLAGS_TRACKED,
+                pose: ret,
+            });
         };
 
         // Check if this hand has an interaction profile
@@ -656,7 +769,8 @@ struct Action {
 }
 
 impl Action {
-    fn get_hand_state(&self, instance: &Instance, path: xr::Path) -> ActionStateData {
+    fn get_hand_state(&self, path: xr::Path) -> ActionStateData {
+        let instance = self.instance.upgrade().expect("Failed to get instance");
         match instance.get_user_path(path).unwrap() {
             None | Some(UserPath::LeftHand) => self.state.left.load(),
             Some(UserPath::RightHand) => self.state.right.load(),
@@ -705,11 +819,11 @@ extern "system" fn create_instance(
     );
     let mut paths = SlotMap::new();
     let mut string_to_path = HashMap::new();
-    paths.insert_with_key(|key| {
+    let left_hand_key = paths.insert_with_key(|key| {
         string_to_path.insert(left.clone(), key);
         left
     });
-    paths.insert_with_key(|key| {
+    let right_hand_key = paths.insert_with_key(|key| {
         string_to_path.insert(right.clone(), key);
         right
     });
@@ -719,6 +833,8 @@ extern "system" fn create_instance(
         paths: Mutex::new(paths),
         string_to_path: Mutex::new(string_to_path),
         action_sets: Default::default(),
+        left_hand_key,
+        right_hand_key,
     });
     unsafe {
         *instance = inst.to_xr();
@@ -755,6 +871,7 @@ extern "system" fn create_session(
         state_synced: true.into(),
         should_render: false.into(),
         frame_state: FrameState::Ended.into(),
+        with_trackers: false.into(),
     });
 
     let tx = sess.event_sender.clone();
@@ -885,7 +1002,7 @@ extern "system" fn create_action(
         xr::ActionType::POSE_INPUT => ActionState::Pose(false),
         xr::ActionType::FLOAT_INPUT => ActionState::Float(0.0),
         xr::ActionType::VECTOR2F_INPUT => ActionState::Vector2(0.0, 0.0),
-        xr::ActionType::VIBRATION_OUTPUT => ActionState::Haptic,
+        xr::ActionType::VIBRATION_OUTPUT => ActionState::Haptic(false),
         other => unimplemented!("unhandled action type: {other:?}"),
     };
     let data = ActionStateData {
@@ -1218,12 +1335,12 @@ extern "system" fn sync_actions(
                 ] {
                     let mut d = state.load();
                     d.changed = false;
-                    if let Some((new_state, change_time)) = new {
-                        if d.state != new_state {
-                            d.changed = true;
-                            d.state = new_state;
-                            d.last_change_time = change_time;
-                        }
+                    if let Some((new_state, change_time)) = new
+                        && d.state != new_state
+                    {
+                        d.changed = true;
+                        d.state = new_state;
+                        d.last_change_time = change_time;
                     }
                     state.store(d);
                 }
@@ -1258,23 +1375,6 @@ extern "system" fn sync_actions(
     xr::Result::SUCCESS
 }
 
-fn get_action_if_attached(
-    session: &Session,
-    info: *const xr::ActionStateGetInfo,
-) -> Option<(Arc<ActionSet>, Arc<Action>)> {
-    let sets = session.attached_sets.get()?;
-    let action = xr::Action::to_handle(unsafe { (*info).action })?;
-    sets.into_iter().find_map(|set| {
-        let set = xr::ActionSet::to_handle(*set)?;
-        for a in set.actions.get().unwrap() {
-            if Arc::as_ptr(a) == Arc::as_ptr(&action) {
-                return Some((set, action.clone()));
-            }
-        }
-        None
-    })
-}
-
 extern "system" fn get_action_state_boolean(
     session: xr::Session,
     info: *const xr::ActionStateGetInfo,
@@ -1291,13 +1391,12 @@ extern "system" fn get_action_state_boolean(
         });
     }
     let session = get_handle!(session);
-    let Some((set, action)) = get_action_if_attached(&session, info) else {
+    let Some((set, action)) = session.get_action_if_attached(info) else {
         return xr::Result::ERROR_ACTIONSET_NOT_ATTACHED;
     };
 
     let info = unsafe { info.as_ref().unwrap() };
-    let instance = session.instance.upgrade().unwrap();
-    let hand_state = action.get_hand_state(&instance, info.subaction_path);
+    let hand_state = action.get_hand_state(info.subaction_path);
     let ActionState::Bool(b) = hand_state.state else {
         return xr::Result::ERROR_ACTION_TYPE_MISMATCH;
     };
@@ -1330,11 +1429,10 @@ extern "system" fn get_action_state_float(
         });
     }
     let session = get_handle!(session);
-    let Some((set, action)) = get_action_if_attached(&session, info) else {
+    let Some((set, action)) = session.get_action_if_attached(info) else {
         return xr::Result::ERROR_ACTIONSET_NOT_ATTACHED;
     };
-    let instance = session.instance.upgrade().unwrap();
-    let hand_state = action.get_hand_state(&instance, unsafe { (*info).subaction_path });
+    let hand_state = action.get_hand_state(unsafe { (*info).subaction_path });
     let ActionState::Float(f) = hand_state.state else {
         return xr::Result::ERROR_ACTION_TYPE_MISMATCH;
     };
@@ -1365,12 +1463,11 @@ extern "system" fn get_action_state_vector2f(
         });
     }
     let session = get_handle!(session);
-    let Some((set, action)) = get_action_if_attached(&session, info) else {
+    let Some((set, action)) = session.get_action_if_attached(info) else {
         return xr::Result::ERROR_ACTIONSET_NOT_ATTACHED;
     };
 
-    let instance = session.instance.upgrade().unwrap();
-    let hand_state = action.get_hand_state(&instance, unsafe { (*info).subaction_path });
+    let hand_state = action.get_hand_state(unsafe { (*info).subaction_path });
     let ActionState::Vector2(x, y) = hand_state.state else {
         return xr::Result::ERROR_ACTION_TYPE_MISMATCH;
     };
@@ -1695,4 +1792,60 @@ fn mat_to_pose(mat: Affine3A) -> xr::Posef {
             z: pos.z,
         },
     }
+}
+
+extern "system" fn apply_haptic_feedback(
+    session: xr::Session,
+    action_info: *const xr::HapticActionInfo,
+    haptic_feedback: *const xr::HapticBaseHeader,
+) -> xr::Result {
+    let session = get_handle!(session);
+
+    const {
+        assert!(
+            std::mem::size_of::<xr::HapticActionInfo>()
+                == std::mem::size_of::<xr::ActionStateGetInfo>()
+        );
+        assert!(
+            std::mem::offset_of!(xr::HapticActionInfo, action)
+                == std::mem::offset_of!(xr::ActionStateGetInfo, action)
+        );
+    }
+
+    println!(
+        "{}",
+        unsafe { action_info.as_ref().unwrap().action }.into_raw()
+    );
+    let Some((_, action)) =
+        session.get_action_if_attached(action_info as *const xr::ActionStateGetInfo)
+    else {
+        return xr::Result::ERROR_ACTIONSET_NOT_ATTACHED;
+    };
+
+    let info = unsafe { action_info.as_ref().unwrap() };
+    let mut hand_state = action.get_hand_state(info.subaction_path);
+    let ActionState::Haptic(_) = hand_state.state else {
+        return xr::Result::ERROR_ACTION_TYPE_MISMATCH;
+    };
+
+    #[allow(clippy::deref_addrof)]
+    if unsafe { *(&raw const (*haptic_feedback).ty) } != xr::HapticVibration::TYPE {
+        return xr::Result::ERROR_VALIDATION_FAILURE;
+    }
+
+    hand_state.state = ActionState::Haptic(true);
+
+    let instance = session.instance.upgrade().unwrap();
+
+    match DefaultKey::from(KeyData::from_ffi(info.subaction_path.into_raw())) {
+        x if x == instance.left_hand_key => {
+            action.state.left.store(hand_state);
+        }
+        x if x == instance.right_hand_key => {
+            action.state.right.store(hand_state);
+        }
+        _ => unreachable!(),
+    }
+
+    xr::Result::SUCCESS
 }

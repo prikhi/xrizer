@@ -1,9 +1,12 @@
-use super::{Input, PoseData, Profiles, WriteOnDrop};
+use super::{Input, PoseData, WriteOnDrop};
 use crate::{
-    input::LoadedActions,
-    openxr_data::{self, Hand},
+    input::{
+        LoadedActions, ManifestLoadedActions,
+        profiles::{self, RunWithProfile},
+    },
+    openxr_data::{self},
 };
-use log::{debug, warn};
+use log::{debug, trace, warn};
 use openvr as vr;
 use openxr as xr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -42,30 +45,39 @@ impl<C: openxr_data::Compositor> Input<C> {
         let session = &session_data.session;
         let legacy = LegacyActionData::new(
             &self.openxr.instance,
-            self.openxr.left_hand.subaction_path,
-            self.openxr.right_hand.subaction_path,
+            self.subaction_paths.left,
+            self.subaction_paths.right,
         );
         let input_data = &session_data.input_data;
 
-        for profile in Profiles::get().profiles_iter() {
-            const fn constrain<F>(f: F) -> F
-            where
-                F: for<'a> Fn(&'a str) -> xr::Path,
-            {
-                f
+        profiles::run_for_all_profiles(&mut Runner {
+            instance: &self.openxr.instance,
+            input_data,
+            legacy: &legacy,
+        });
+
+        struct Runner<'a> {
+            instance: &'a xr::Instance,
+            input_data: &'a super::InputSessionData,
+            legacy: &'a LegacyActionData,
+        }
+
+        impl RunWithProfile for Runner<'_> {
+            fn run<P: super::InteractionProfile>(&mut self) {
+                let conv = super::profiles::InputToXrPath::new(self.instance);
+                let bindings = P::legacy_bindings(&conv);
+                self.instance
+                    .suggest_interaction_profile_bindings(
+                        self.instance.string_to_path(P::profile_path()).unwrap(),
+                        &bindings
+                            .into_iter(
+                                &self.legacy.actions,
+                                self.input_data.pose_data.get().unwrap(),
+                            )
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap();
             }
-            let stp = constrain(|s| self.openxr.instance.string_to_path(s).unwrap());
-            let bindings = profile.legacy_bindings(&stp);
-            let profile = stp(profile.profile_path());
-            self.openxr
-                .instance
-                .suggest_interaction_profile_bindings(
-                    profile,
-                    &bindings
-                        .into_iter(&legacy.actions, input_data.pose_data.get().unwrap())
-                        .collect::<Vec<_>>(),
-                )
-                .unwrap();
         }
 
         let pose_set = &input_data.pose_data.get().unwrap().set;
@@ -84,6 +96,75 @@ impl<C: openxr_data::Compositor> Input<C> {
             .actions
             .set(LoadedActions::Legacy(legacy))
             .unwrap_or_else(|_| panic!("Actions unexpectedly set up"));
+    }
+
+    pub fn legacy_haptic(
+        &self,
+        device_index: vr::TrackedDeviceIndex_t,
+        _axis_id: u32, // TODO: what is this for?
+        duration_us: std::ffi::c_ushort,
+    ) {
+        let Some(hand) = self.device_index_to_hand(device_index) else {
+            debug!("tried triggering haptic on invalid device index: {device_index}");
+            return;
+        };
+        let hand_path = self.get_subaction_path(hand);
+
+        let data = self.openxr.session_data.get();
+        if let Some(manifest_actions) = data.input_data.get_loaded_actions() {
+            // Game provided action manifest but also calls the legacy action's pulse method.
+            self.legacy_haptic_via_manifest(manifest_actions, hand_path, duration_us);
+            return;
+        }
+
+        let Some(legacy) = data.input_data.get_legacy_actions() else {
+            debug!("tried triggering haptic, but legacy actions aren't ready");
+            return;
+        };
+
+        let duration_nanos = std::time::Duration::from_micros(duration_us as u64).as_nanos();
+
+        debug!(
+            "triggering legacy haptic for {duration_us} microseconds ({} seconds/{} milliseconds)",
+            std::time::Duration::from_micros(duration_us as _).as_secs_f32(),
+            std::time::Duration::from_micros(duration_us as _).as_millis()
+        );
+
+        if let Err(e) = legacy.actions.haptic.apply_feedback(
+            &data.session,
+            hand_path,
+            &xr::HapticVibration::new()
+                .amplitude(1.0)
+                .frequency(xr::FREQUENCY_UNSPECIFIED)
+                .duration(xr::Duration::from_nanos(duration_nanos as i64)),
+        ) {
+            warn!("Failed to trigger haptic: {e:?}");
+        }
+    }
+
+    /// Trigger a full amplitude vibration on the given path via the global `haptic_action` in our
+    /// loaded Manifest Actions.
+    ///
+    /// This is necessary for the legacy input system to handle because applications may call
+    /// legacy-input haptic interface functions while providing manifest files.
+    fn legacy_haptic_via_manifest(
+        &self,
+        manifest_actions: &ManifestLoadedActions,
+        hand_path: xr::Path,
+        duration_us: ::std::ffi::c_ushort,
+    ) {
+        trace!("triggered legacy haptic while using action manifest");
+        manifest_actions
+            .haptic_action
+            .apply_feedback(
+                &self.openxr.session_data.get().session,
+                hand_path,
+                &xr::HapticVibration::new()
+                    .amplitude(1.0)
+                    .frequency(xr::FREQUENCY_UNSPECIFIED)
+                    .duration(xr::Duration::from_nanos(i64::from(duration_us) * 1000)),
+            )
+            .unwrap();
     }
 
     pub fn get_legacy_controller_state(
@@ -119,16 +200,14 @@ impl<C: openxr_data::Compositor> Input<C> {
         };
         let actions = &legacy.actions;
 
-        let Ok(hand) = Hand::try_from(device_index) else {
-            debug!("requested controller state for invalid device index: {device_index}");
+        let Some(hand) = self.device_index_to_hand(device_index) else {
+            debug!(
+                "tried getting controller state, but device index {device_index} is invalid or not a controller!"
+            );
             return false;
         };
 
-        let hand_info = match hand {
-            Hand::Left => &self.openxr.left_hand,
-            Hand::Right => &self.openxr.right_hand,
-        };
-        let hand_path = hand_info.subaction_path;
+        let hand_path = self.get_subaction_path(hand);
 
         let data = self.openxr.session_data.get();
 
@@ -252,6 +331,7 @@ pub(super) struct Legacy<M: ActionsMarker> {
     pub main_xy: Action<xr::Vector2f, M>,
     pub main_xy_touch: Action<bool, M>,
     pub main_xy_click: Action<bool, M>,
+    pub haptic: Action<xr::Haptic, M>,
     pub extra: M,
 }
 
@@ -274,6 +354,7 @@ impl LegacyBindings {
             }
         }
 
+        // TODO: figure out how to automatically derive this...
         bindings![
             self.extra
                 .grip_pose
@@ -287,7 +368,8 @@ impl LegacyBindings {
             squeeze,
             main_xy,
             main_xy_touch,
-            main_xy_click
+            main_xy_click,
+            haptic,
         ]
     }
 }
@@ -328,6 +410,7 @@ impl LegacyActionData {
             main_xy_touch: set
                 .create_action("main-joystick-touch", "Main Joystick Touch", &leftright)
                 .unwrap(),
+            haptic: set.create_action("haptic", "Haptic", &leftright).unwrap(),
             extra: Actions,
         };
 
@@ -338,7 +421,8 @@ impl LegacyActionData {
 #[cfg(test)]
 mod tests {
     use crate::input::profiles::{knuckles::Knuckles, simple_controller::SimpleController};
-    use crate::input::tests::{compare_pose, Fixture};
+    use crate::input::tests::{Fixture, compare_pose};
+    use crate::openxr_data::Hand;
     use openvr as vr;
     use openxr as xr;
 
@@ -408,8 +492,8 @@ mod tests {
         let mut f = Fixture::new();
         f.input.openxr.restart_session();
 
-        f.set_interaction_profile(&Knuckles, LeftHand);
-        f.set_interaction_profile(&Knuckles, RightHand);
+        f.set_interaction_profile::<Knuckles>(LeftHand);
+        f.set_interaction_profile::<Knuckles>(RightHand);
         f.input.frame_start_update();
         f.input.openxr.poll_events();
         let action = get_action(
@@ -467,13 +551,9 @@ mod tests {
             // The braces around state.ulButtonPressed are to force create a copy, because
             // VRControllerState_t is a packed struct and references to unaligned fields are undefined.
             let mask = if touch {
-                {
-                    state.ulButtonTouched
-                }
+                state.ulButtonTouched
             } else {
-                {
-                    state.ulButtonPressed
-                }
+                state.ulButtonPressed
             };
 
             match expect {
@@ -507,7 +587,10 @@ mod tests {
         };
 
         let hands = [LeftHand, RightHand];
-        // Initial state
+
+        while let Some(event) = get_event() {
+            assert_eq!(event.ty, vr::EVREventType::TrackedDeviceActivated as u32);
+        }
 
         for hand in hands {
             let state = get_state(hand);
@@ -622,10 +705,14 @@ mod tests {
 
     #[test]
     fn no_legacy_input_with_manifest() {
-        let f = Fixture::new();
+        let mut f = Fixture::new();
 
         f.input.openxr.restart_session();
+
+        f.set_interaction_profile::<SimpleController>(fakexr::UserPath::LeftHand);
+        f.set_interaction_profile::<SimpleController>(fakexr::UserPath::RightHand);
         f.input.frame_start_update();
+        f.input.openxr.poll_events();
 
         let mut state = vr::VRControllerState_t::default();
         assert!(f.input.get_legacy_controller_state(
@@ -635,6 +722,7 @@ mod tests {
         ));
 
         f.load_actions(c"actions.json");
+        f.input.openxr.poll_events();
         f.input.frame_start_update();
         assert!(!f.input.get_legacy_controller_state(
             1,
@@ -648,8 +736,8 @@ mod tests {
         use fakexr::UserPath::*;
         let mut f = Fixture::new();
         f.input.openxr.restart_session();
-        f.set_interaction_profile(&SimpleController, LeftHand);
-        f.set_interaction_profile(&SimpleController, RightHand);
+        f.set_interaction_profile::<SimpleController>(LeftHand);
+        f.set_interaction_profile::<SimpleController>(RightHand);
         f.input.frame_start_update();
         f.input.openxr.poll_events();
 
@@ -658,17 +746,16 @@ mod tests {
         f.input.frame_start_update();
 
         let seated_origin = vr::ETrackingUniverseOrigin::Seated;
-        let left_pose = f
-            .input
-            .get_controller_pose(super::Hand::Left, Some(seated_origin));
+        let left_pose = f.input.get_controller_pose(Hand::Left, Some(seated_origin));
         compare_pose(
             xr::Posef::IDENTITY,
-            left_pose.mDeviceToAbsoluteTracking.into(),
+            left_pose.unwrap().mDeviceToAbsoluteTracking.into(),
         );
         compare_pose(
             xr::Posef::IDENTITY,
             f.input
-                .get_controller_pose(super::Hand::Right, Some(seated_origin))
+                .get_controller_pose(Hand::Right, Some(seated_origin))
+                .unwrap()
                 .mDeviceToAbsoluteTracking
                 .into(),
         );
@@ -688,14 +775,16 @@ mod tests {
         compare_pose(
             new_pose,
             f.input
-                .get_controller_pose(super::Hand::Left, Some(seated_origin))
+                .get_controller_pose(Hand::Left, Some(seated_origin))
+                .unwrap()
                 .mDeviceToAbsoluteTracking
                 .into(),
         );
         compare_pose(
             new_pose,
             f.input
-                .get_controller_pose(super::Hand::Right, Some(seated_origin))
+                .get_controller_pose(Hand::Right, Some(seated_origin))
+                .unwrap()
                 .mDeviceToAbsoluteTracking
                 .into(),
         );
@@ -716,5 +805,96 @@ mod tests {
 
         let state = unsafe { state.assume_init() };
         assert_eq!({ state.ulButtonPressed }, 0);
+    }
+
+    #[test]
+    fn legacy_haptic() {
+        let mut f = Fixture::new();
+        f.input.openxr.restart_session();
+        f.set_interaction_profile::<SimpleController>(fakexr::UserPath::LeftHand);
+        f.set_interaction_profile::<SimpleController>(fakexr::UserPath::RightHand);
+        f.input.openxr.poll_events();
+        f.input.frame_start_update();
+
+        f.input.openxr.poll_events();
+        f.input.frame_start_update();
+        let haptic = f
+            .input
+            .openxr
+            .session_data
+            .get()
+            .input_data
+            .get_legacy_actions()
+            .unwrap()
+            .actions
+            .haptic
+            .as_raw();
+
+        assert!(!fakexr::is_haptic_activated(
+            haptic,
+            fakexr::UserPath::LeftHand
+        ));
+        assert!(!fakexr::is_haptic_activated(
+            haptic,
+            fakexr::UserPath::RightHand
+        ));
+
+        f.input.legacy_haptic(1, 0, 3000);
+        assert!(fakexr::is_haptic_activated(
+            haptic,
+            fakexr::UserPath::LeftHand
+        ));
+
+        f.input.legacy_haptic(2, 0, 3000);
+        assert!(fakexr::is_haptic_activated(
+            haptic,
+            fakexr::UserPath::RightHand
+        ));
+    }
+
+    #[test]
+    fn legacy_haptic_with_action_manifest() {
+        let mut f = Fixture::new();
+        f.load_actions(c"actions.json");
+        f.input.openxr.restart_session();
+        f.set_interaction_profile::<SimpleController>(fakexr::UserPath::LeftHand);
+        f.set_interaction_profile::<SimpleController>(fakexr::UserPath::RightHand);
+        f.input.openxr.poll_events();
+        f.input.frame_start_update();
+
+        f.input.openxr.poll_events();
+        f.input.frame_start_update();
+
+        let haptic = f
+            .input
+            .openxr
+            .session_data
+            .get()
+            .input_data
+            .get_loaded_actions()
+            .unwrap()
+            .haptic_action
+            .as_raw();
+
+        assert!(!fakexr::is_haptic_activated(
+            haptic,
+            fakexr::UserPath::LeftHand
+        ));
+        assert!(!fakexr::is_haptic_activated(
+            haptic,
+            fakexr::UserPath::RightHand
+        ));
+
+        f.input.legacy_haptic(1, 0, 3000);
+        assert!(fakexr::is_haptic_activated(
+            haptic,
+            fakexr::UserPath::LeftHand
+        ));
+
+        f.input.legacy_haptic(2, 0, 3000);
+        assert!(fakexr::is_haptic_activated(
+            haptic,
+            fakexr::UserPath::RightHand
+        ));
     }
 }

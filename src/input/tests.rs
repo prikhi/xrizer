@@ -1,9 +1,9 @@
 use super::{
+    ActionData, Input, InteractionProfile,
     profiles::{
-        knuckles::Knuckles, oculus_touch::Touch, simple_controller::SimpleController,
+        knuckles::Knuckles, oculus_touch::OculusTouch, simple_controller::SimpleController,
         vive_controller::ViveWands,
     },
-    ActionData, Input, InteractionProfile,
 };
 use crate::{
     input::ActionKey,
@@ -343,18 +343,14 @@ impl Fixture {
         }
     }
 
-    pub fn set_interaction_profile(
-        &mut self,
-        profile: &dyn InteractionProfile,
-        hand: fakexr::UserPath,
-    ) {
+    pub fn set_interaction_profile<P: InteractionProfile>(&mut self, hand: fakexr::UserPath) {
         fakexr::set_interaction_profile(
             self.raw_session(),
             hand,
             self.input
                 .openxr
                 .instance
-                .string_to_path(profile.profile_path())
+                .string_to_path(P::profile_path())
                 .unwrap(),
         );
         self.pending_profile_change = true;
@@ -407,14 +403,15 @@ fn input_state_flow() {
 
     f.load_actions(c"actions.json");
 
-    assert!(f
-        .input
-        .openxr
-        .session_data
-        .get()
-        .input_data
-        .get_legacy_actions()
-        .is_none());
+    assert!(
+        f.input
+            .openxr
+            .session_data
+            .get()
+            .input_data
+            .get_legacy_actions()
+            .is_none()
+    );
 
     f.sync(vr::VRActiveActionSet_t {
         ulActionSet: set1,
@@ -480,19 +477,23 @@ fn reload_manifest_on_session_restart() {
 
 #[track_caller]
 pub fn compare_pose(expected: xr::Posef, actual: xr::Posef) {
+    fn float_eq(a: f32, b: f32) -> bool {
+        (a - b).abs() < f32::EPSILON
+    }
     let epos = expected.position;
     let apos = actual.position;
     assert!(
-        (apos.x - epos.x).abs() < f32::EPSILON
-            && (apos.y - epos.y).abs() < f32::EPSILON
-            && (apos.z - epos.z).abs() < f32::EPSILON,
+        float_eq(apos.x, epos.x) && float_eq(apos.y, epos.y) && float_eq(apos.z, epos.z),
         "expected position: {epos:?}\nactual position: {apos:?}"
     );
 
     let erot = expected.orientation;
     let arot = actual.orientation;
     assert!(
-        arot.x == erot.x && arot.y == erot.y && arot.z == erot.z && arot.w == erot.w,
+        float_eq(arot.x, erot.x)
+            && float_eq(arot.y, erot.y)
+            && float_eq(arot.z, erot.z)
+            && float_eq(arot.w, erot.w),
         "expected orientation: {erot:?}\nactual orientation: {arot:?}",
     );
 }
@@ -504,7 +505,27 @@ fn raw_pose_waitgetposes_and_skeletal_pose_identical() {
     let pose_handle = f.get_action_handle(c"/actions/set1/in/pose");
     let skel_handle = f.get_action_handle(c"/actions/set1/in/skellyl");
     f.load_actions(c"actions.json");
-    f.set_interaction_profile(&Knuckles, LeftHand);
+    f.set_interaction_profile::<Knuckles>(LeftHand);
+
+    let frame = || {
+        f.input.openxr.poll_events();
+        f.input.frame_start_update();
+    };
+
+    // we need to wait two frames for the controller to be connected.
+    frame();
+    assert!(
+        f.input
+            .get_controller_device_index(super::Hand::Left)
+            .is_none()
+    );
+    frame();
+    assert!(
+        f.input
+            .get_controller_device_index(super::Hand::Left)
+            .is_some()
+    );
+
     let rot = Quat::from_rotation_x(-FRAC_PI_4);
     let pose = xr::Posef {
         position: xr::Vector3f {
@@ -545,7 +566,7 @@ fn raw_pose_waitgetposes_and_skeletal_pose_identical() {
     );
     assert_eq!(ret, vr::EVRInputError::None);
     compare_pose(
-        waitgetposes_pose.mDeviceToAbsoluteTracking.into(),
+        waitgetposes_pose.unwrap().mDeviceToAbsoluteTracking.into(),
         raw_pose.pose.mDeviceToAbsoluteTracking.into(),
     );
 
@@ -559,7 +580,7 @@ fn raw_pose_waitgetposes_and_skeletal_pose_identical() {
     assert_eq!(ret, vr::EVRInputError::None);
 
     compare_pose(
-        waitgetposes_pose.mDeviceToAbsoluteTracking.into(),
+        waitgetposes_pose.unwrap().mDeviceToAbsoluteTracking.into(),
         skel_pose.pose.mDeviceToAbsoluteTracking.into(),
     );
 }
@@ -570,8 +591,14 @@ fn actions_with_bad_paths() {
     let spaces = f.get_action_handle(c"/actions/set1/in/action with spaces");
     let commas = f.get_action_handle(c"/actions/set1/in/action,with,commas");
     let mixed = f.get_action_handle(c"/actions/set1/in/mixed, action");
+    let paren = f.get_action_handle(c"/actions/set1/in/(action)(with)(parenthesis)");
+    let brackets = f.get_action_handle(c"/actions/set1/in/[action][with][brackets]");
     let long_bad1 = f.get_action_handle(c"/actions/set1/in/ThisActionHasAReallyLongNameThatIsMostCertainlyLongerThanTheOpenXRLimit,However,ItWillBeGivenASimpleLocalizedName");
     let long_bad2 = f.get_action_handle(c"/actions/set1/in/ThisActionWillAlsoHaveAReallyLongNameAndAShortLocalizedName,MuchLikeThePreviousAction");
+    let long_exact = f.get_action_handle(
+        c"/actions/set1/in/this right here is an action that is exactly 64 characters long!",
+    );
+
     let set1 = f.get_action_set_handle(c"/actions/set1");
     f.load_actions(c"actions_malformed_paths.json");
 
@@ -600,6 +627,21 @@ fn actions_with_bad_paths() {
         fakexr::ActionState::Bool(false),
         LeftHand,
     );
+    fakexr::set_action_state(
+        f.get_action::<bool>(long_exact),
+        fakexr::ActionState::Bool(false),
+        LeftHand,
+    );
+    fakexr::set_action_state(
+        f.get_action::<bool>(paren),
+        fakexr::ActionState::Bool(false),
+        LeftHand,
+    );
+    fakexr::set_action_state(
+        f.get_action::<bool>(brackets),
+        fakexr::ActionState::Bool(false),
+        LeftHand,
+    );
     f.sync(vr::VRActiveActionSet_t {
         ulActionSet: set1,
         ..Default::default()
@@ -615,12 +657,27 @@ fn actions_with_bad_paths() {
     assert!(s.bState);
     assert!(s.bChanged);
 
+    let s = f.get_bool_state(paren).unwrap();
+    assert!(s.bActive);
+    assert!(!s.bState);
+    assert!(!s.bChanged);
+
+    let s = f.get_bool_state(brackets).unwrap();
+    assert!(s.bActive);
+    assert!(!s.bState);
+    assert!(!s.bChanged);
+
     let s = f.get_bool_state(long_bad1).unwrap();
     assert!(s.bActive);
     assert!(!s.bState);
     assert!(!s.bChanged);
 
     let s = f.get_bool_state(long_bad2).unwrap();
+    assert!(s.bActive);
+    assert!(!s.bState);
+    assert!(!s.bChanged);
+
+    let s = f.get_bool_state(long_exact).unwrap();
     assert!(s.bActive);
     assert!(!s.bState);
     assert!(!s.bChanged);
@@ -644,8 +701,8 @@ fn pose_action_no_restrict() {
     let poser = f.get_action_handle(c"/actions/set1/in/poser");
 
     f.load_actions(c"actions.json");
-    f.set_interaction_profile(&SimpleController, LeftHand);
-    f.set_interaction_profile(&SimpleController, RightHand);
+    f.set_interaction_profile::<SimpleController>(LeftHand);
+    f.set_interaction_profile::<SimpleController>(RightHand);
     let session = f.input.openxr.session_data.get().session.as_raw();
     let pose_left = xr::Posef {
         position: xr::Vector3f {
@@ -690,8 +747,8 @@ fn raw_pose_switch_profile() {
     let poser = f.get_action_handle(c"/actions/set1/in/poser");
 
     f.load_actions(c"actions.json");
-    f.set_interaction_profile(&SimpleController, LeftHand);
-    f.set_interaction_profile(&SimpleController, RightHand);
+    f.set_interaction_profile::<SimpleController>(LeftHand);
+    f.set_interaction_profile::<SimpleController>(RightHand);
     let session = f.input.openxr.session_data.get().session.as_raw();
     let pose_left = xr::Posef {
         position: xr::Vector3f {
@@ -737,19 +794,17 @@ fn raw_pose_switch_profile() {
         }
     }
 
-    for (handle, expected) in [
-        (posel, &SimpleController.offset_grip_pose(Hand::Left)),
-        (poser, &SimpleController.offset_grip_pose(Hand::Right)),
-    ] {
+    for (handle, hand) in [(posel, Hand::Left), (poser, Hand::Right)] {
+        let expected = &SimpleController::offset_grip_pose(hand);
         let actual = f.get_pose(handle, 0).unwrap();
-        assert!(actual.bActive);
+        assert!(actual.bActive, "{hand:?} not active");
         let p = actual.pose;
-        assert!(p.bPoseIsValid);
+        assert!(p.bPoseIsValid, "{hand:?} invalid pose");
         compare_pose(offset_to_pose(expected), p.mDeviceToAbsoluteTracking.into());
     }
 
-    f.set_interaction_profile(&Touch, LeftHand);
-    f.set_interaction_profile(&Touch, RightHand);
+    f.set_interaction_profile::<OculusTouch>(LeftHand);
+    f.set_interaction_profile::<OculusTouch>(RightHand);
 
     // Cached poses don't reset until next frame
     f.input.openxr.poll_events();
@@ -761,8 +816,8 @@ fn raw_pose_switch_profile() {
     });
 
     for (handle, expected) in [
-        (posel, &Touch.offset_grip_pose(Hand::Left)),
-        (poser, &Touch.offset_grip_pose(Hand::Right)),
+        (posel, &OculusTouch::offset_grip_pose(Hand::Left)),
+        (poser, &OculusTouch::offset_grip_pose(Hand::Right)),
     ] {
         let actual = f.get_pose(handle, 0).unwrap();
         assert!(actual.bActive);
@@ -778,7 +833,7 @@ fn cased_actions() {
     let set1 = f.get_action_set_handle(c"/actions/set1");
     f.load_actions(c"actions_cased.json");
 
-    let path = ViveWands.profile_path();
+    let path = ViveWands::profile_path();
     f.verify_bindings::<bool>(
         path,
         c"/actions/set1/in/BoolAct",
@@ -800,7 +855,7 @@ fn cased_actions() {
         ["/user/hand/left/output/haptic".into()],
     );
 
-    f.set_interaction_profile(&ViveWands, LeftHand);
+    f.set_interaction_profile::<ViveWands>(LeftHand);
     let session = f.input.openxr.session_data.get().session.as_raw();
     fakexr::set_grip(session, LeftHand, xr::Posef::IDENTITY);
     fakexr::set_aim(session, LeftHand, xr::Posef::IDENTITY);
@@ -952,15 +1007,16 @@ fn detect_controller_after_manifest_load() {
     };
 
     frame();
-    assert!(!f.input.openxr.left_hand.connected());
+    assert!(f.input.get_controller_device_index(Hand::Left).is_none());
 
-    f.set_interaction_profile(&Knuckles, fakexr::UserPath::LeftHand);
+    f.set_interaction_profile::<Knuckles>(fakexr::UserPath::LeftHand);
     frame();
     // Profile won't be set for this frame - we call sync after events have already been polled
-    assert!(!f.input.openxr.left_hand.connected());
+    assert!(f.input.get_controller_device_index(Hand::Left).is_none());
 
     frame();
-    assert!(f.input.openxr.left_hand.connected());
+    let index = f.input.get_controller_device_index(Hand::Left);
+    assert!(index.is_some_and(|i| f.input.is_device_connected(i)));
 }
 
 #[test]
@@ -975,9 +1031,15 @@ fn empty_manifest() {
 
 #[test]
 fn load_actions_race() {
-    let mut f = Arc::new(Fixture::new());
+    let mut f = Fixture::new();
     f.input.openxr.restart_session(); // get to real session
+
+    f.set_interaction_profile::<OculusTouch>(LeftHand);
+    f.set_interaction_profile::<OculusTouch>(RightHand);
+
+    let mut f = Arc::new(f);
     f.input.frame_start_update(); // load legacy
+    f.input.openxr.poll_events();
     let got_input = f.input.get_legacy_controller_state(
         1,
         &mut vr::VRControllerState_t::default(),

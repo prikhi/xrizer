@@ -2,9 +2,9 @@ use bindgen::callbacks::ParseCallbacks;
 
 use prettyplease::unparse;
 use proc_macro2::TokenStream;
-use quote::{format_ident, ToTokens};
+use quote::{ToTokens, format_ident};
 use regex::Regex;
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::{HashMap, hash_map::Entry};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -90,8 +90,11 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let header_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("headers");
     let headers = [
+        version!(2, 15, 6),
+        version!(2, 12, 14),
         version!(2, 5, 1),
         version!(2, 0, 10),
+        version!(1, 23, 7),
         version!(1, 16, 8),
         version!(1, 14, 15),
         version!(1, 8, 19),
@@ -99,12 +102,17 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
         version!(1, 4, 18),
         version!(1, 3, 22),
         version!(1, 0, 17),
+        version!(1, 0, 11),
         version!(1, 0, 10),
         version!(1, 0, 9),
         version!(1, 0, 7),
         version!(1, 0, 5),
         version!(1, 0, 4),
         version!(1, 0, 3),
+        version!(1, 0, 1),
+        version!(0, 9, 20),
+        version!(0, 9, 17),
+        version!(0, 9, 15),
         version!(0, 9, 12),
     ];
     let mut pruned_headers = headers.map(|(header, version)| {
@@ -166,11 +174,15 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enable_cxx_namespaces()
         .allowlist_item("vr.*::k_.*") // constants
         .allowlist_item("vr.*::VR.*")
+        .allowlist_item("vr.*::EVRComponentProperty")
+        .allowlist_item("vr.*::EKeyboardFlags")
         .allowlist_item("Vk.*")
         .blocklist_function("vr.*::VR_.*")
         .derive_default(true)
         .no_default("vr.*::IVR.*")
         .bitfield_enum("vr.*::EVRSubmitFlags")
+        .bitfield_enum("vr.*::EVRComponentProperty")
+        .bitfield_enum("vr.*::EKeyboardFlags")
         .rustified_enum(".*")
         .vtable_generation(true)
         .generate_cstr(true)
@@ -214,6 +226,16 @@ fn prune_header(header: &str, version: &str) -> String {
             continue;
         }
 
+        // 0.9.12 header has duplicate macros/definitions with 0.9.15 that will
+        // cause clang to throw errors
+        if version == "vr_0_9_12"
+            && (line.starts_with("# define VR_CLANG_ATTR")
+                || line.ends_with("*VR_CALLTYPE VRApplications();")
+                || line.ends_with("*VR_CALLTYPE VRSettings();"))
+        {
+            continue;
+        }
+
         let mut line = VR_REGEX.replace_all(&line, &format!("${{1}}{version}${{3}}"));
         line += "\n";
         out.push_str(&line);
@@ -232,15 +254,19 @@ fn verify_fields_are_identical<'a, T>(
 ) where
     T: IntoIterator<Item = &'a syn::Field>,
 {
-    for (existing_field, new_field) in existing.into_iter().zip(new.into_iter()) {
+    for (existing_field, new_field) in existing.into_iter().zip(new) {
         if existing_field.ident != new_field.ident {
             let idents = [
                 existing_field.ident.as_ref().unwrap().to_string(),
                 new_field.ident.as_ref().unwrap().to_string(),
             ];
-            assert!(idents.contains(&"repeatCount".into()) && idents.contains(&"unused".into()),
+            assert!(
+                idents.contains(&"repeatCount".into()) && idents.contains(&"unused".into())
+                    || idents[1] == (idents[0].clone() + "_deprecated"),
                 "Non-allowed differently named fields in {ident} (left = {:?} from {existing_mod}, right = {:?} from {new_mod})",
-                existing_field.ident, new_field.ident);
+                existing_field.ident,
+                new_field.ident
+            );
         }
 
         fn extract_type<'a>(
@@ -550,19 +576,19 @@ fn versionify_interface(
     let mut replace = None;
     // check if we already pulled this version
     let version_num: u32 = version_str.parse().unwrap();
-    if let Some(versions) = versioned.get_mut(interface) {
-        if let Some(old_item) = versions.iter_mut().find(|item| item.version == version_num) {
-            let old_version: HeaderVersion = old_item.parent_mod.to_string().parse().unwrap();
-            let new_version: HeaderVersion = item_mod.to_string().parse().unwrap();
+    if let Some(versions) = versioned.get_mut(interface)
+        && let Some(old_item) = versions.iter_mut().find(|item| item.version == version_num)
+    {
+        let old_version: HeaderVersion = old_item.parent_mod.to_string().parse().unwrap();
+        let new_version: HeaderVersion = item_mod.to_string().parse().unwrap();
 
-            // only replace it if we have the same version from a newer header -
-            // the headers like to add new things without updating versions
-            if old_version >= new_version {
-                return;
-            }
-
-            replace = Some(old_item);
+        // only replace it if we have the same version from a newer header -
+        // the headers like to add new things without updating versions
+        if old_version >= new_version {
+            return;
         }
+
+        replace = Some(old_item);
     }
 
     // change names
@@ -577,7 +603,7 @@ fn versionify_interface(
         panic!("vtable field was not pointer");
     };
     let vtable_ident = &vtable.ident;
-    ty.elem = Box::new(parse_quote!(#vtable_ident));
+    *ty.elem = parse_quote!(#vtable_ident);
 
     for field in vtable.fields.iter_mut() {
         let syn::Type::BareFn(f) = &mut field.ty else {
@@ -594,7 +620,7 @@ fn versionify_interface(
             unreachable!();
         };
         let versioned_ident = &versioned_struct.ident;
-        this.elem = Box::new(parse_quote!(#versioned_ident));
+        *this.elem = parse_quote!(#versioned_ident);
 
         for arg in args {
             let syn::Type::Path(path) = extract_array_or_ptr_type(&mut arg.ty) else {
@@ -645,7 +671,7 @@ fn process_vr_namespace_content(
             incompatible_items: &IncompatibleItems,
             ty: &mut syn::Type,
         ) {
-            static PRIMITIVES: &[&str] = &["u32", "f32", "u64", "f64", "bool", "c_char"];
+            static PRIMITIVES: &[&str] = &["u32", "i32", "f32", "u64", "f64", "bool", "c_char"];
             match extract_array_or_ptr_type(ty) {
                 syn::Type::Path(type_path) => {
                     let type_name = type_path.path.segments.last().unwrap().ident.to_string();
@@ -712,7 +738,12 @@ fn process_vr_namespace_content(
             }
             syn::Item::Union(mut item) => {
                 unversion_fields(&mut item.fields.named);
-                if vr_mod.ident == "vr_0_9_12" && item.ident == "VREvent_Data_t" {
+                if (vr_mod.ident == "vr_0_9_12"
+                    || vr_mod.ident == "vr_0_9_15"
+                    || vr_mod.ident == "vr_0_9_17"
+                    || vr_mod.ident == "vr_0_9_20")
+                    && item.ident == "VREvent_Data_t"
+                {
                     for field in &mut item.fields.named {
                         reversion_type(&incompatible_items, &mut field.ty);
                     }
@@ -731,6 +762,19 @@ fn process_vr_namespace_content(
                         "vr_0_9_12",
                         &["VREvent_t", "VREvent_Reserved_t", "Compositor_FrameTiming"],
                     ),
+                    (
+                        "vr_0_9_15",
+                        &["VREvent_Reserved_t", "Compositor_FrameTiming"],
+                    ),
+                    (
+                        "vr_0_9_17",
+                        &["VREvent_Reserved_t", "Compositor_FrameTiming"],
+                    ),
+                    (
+                        "vr_0_9_20",
+                        &["VREvent_Reserved_t", "Compositor_FrameTiming"],
+                    ),
+                    ("vr_1_0_1", &["Compositor_FrameTiming"]),
                     ("vr_1_0_3", &["Compositor_FrameTiming"]),
                 ];
                 let should_reversion = INCOMPAT_STRUCTS
@@ -857,9 +901,9 @@ fn process_and_versionify_types(tokens: TokenStream) -> String {
         }
     }
 
-    let versioned = versioned.into_iter().flat_map(|(_, mut versions)| {
+    let versioned = versioned.into_values().flat_map(|mut versions| {
         // reverse sort - start with highest interface version and go down
-        versions.sort_by(|a, b| b.version.cmp(&a.version));
+        versions.sort_by_key(|a| std::cmp::Reverse(a.version));
 
         let mut items = Vec::new();
         let mut prev_sigs = Vec::new();
@@ -915,10 +959,10 @@ fn process_and_versionify_types(tokens: TokenStream) -> String {
         .flat_map(|(name, (mut item, parent))| {
             // TODO: use the add_attributes method on ParseCallbacks instead
             // after updating bindgen?
-            if let syn::Item::Enum(e) = &mut item {
-                if e.ident == "EVREventType" {
-                    e.attrs.push(parse_quote!(#[try_from(repr)]));
-                }
+            if let syn::Item::Enum(e) = &mut item
+                && e.ident == "EVREventType"
+            {
+                e.attrs.push(parse_quote!(#[try_from(repr)]));
             }
 
             let mut items = vec![item];

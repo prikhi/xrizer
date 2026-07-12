@@ -41,6 +41,10 @@
 			"type": "vector3"
 		},
 		{
+			"name": "/actions/set1/in/ScrollAct",
+			"type": "vector2"
+		},
+		{
 			"name": "/actions/set1/in/Pose",
 			"requirement": "optional",
 			"type": "pose"
@@ -85,6 +89,10 @@
 		{
 			"binding_url": "oculus.json",
 			"controller_type": "oculus_touch"
+		},
+		{
+			"binding_url": "focus3.json",
+			"controller_type": "vive_focus3_controller"
 		}
 	],
 	"localization": []

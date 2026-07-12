@@ -3,7 +3,7 @@ mod convert;
 pub use bindings::vr::*;
 pub use bindings::{VkInstance_T, VkPhysicalDevice_T};
 pub use convert::space_relation_to_openvr_pose;
-use std::ffi::{c_void, CStr};
+use std::ffi::{CStr, c_void};
 use std::sync::{Arc, Weak};
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
@@ -47,6 +47,7 @@ pub trait InterfaceImpl: Sync + Send + 'static {
     fn get_version(version: &CStr) -> Option<InterfaceGetter<Self>>;
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for ETrackingResult {
     fn default() -> Self {
         Self::Uninitialized

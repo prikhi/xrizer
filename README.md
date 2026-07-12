@@ -38,9 +38,9 @@ When running games through the Steam Linux Runtime - which is all of them when u
 - Paths under `/usr` will be available at `/run/host/usr`
 - Some paths will be completely unavailable.
 
-You can make paths available within the container using the `PRESSURE_VESSEL_FILESYSTEM_RW` env var. An example of what you might put in your game's steam launch option if you want to use xrizer with Monado installed systemwide is:
+You can make paths available within the container using the `PRESSURE_VESSEL_FILESYSTEMS_RW` env var. An example of what you might put in your game's steam launch option if you want to use xrizer with Monado installed systemwide is:
 ```
-XR_RUNTIME_JSON=/run/host/usr/share/openxr/1/openxr_monado.json VR_OVERRIDE=/path/to/xrizer PRESSURE_VESSEL_FILESYSTEM_RW=$XDG_RUNTIME_DIR/monado_comp_ipc
+XR_RUNTIME_JSON=/run/host/usr/share/openxr/1/openxr_monado.json VR_OVERRIDE=/path/to/xrizer PRESSURE_VESSEL_FILESYSTEMS_RW=$XDG_RUNTIME_DIR/monado_comp_ipc
 ```
 For more info on the container, see [Valve's docs on Pressure Vessel](https://gitlab.steamos.cloud/steamrt/steam-runtime-tools/-/blob/main/pressure-vessel/wrap.1.md).
 
@@ -81,6 +81,8 @@ _RUST_LOG_ - This is used for adjusting the logging of xrizer. See the [env_logg
 - `tracked_property` - logs the name and device index of each requested tracked device property.
 
 _XRIZER_CUSTOM_BINDINGS_DIR_ - This can be used to supply a directory that xrizer will search for controller bindings files. Note that the format of these bindings aren't actually documented anywhere, but it's easy enough to modify an existing file, and xrizer parses them so you can read the source too.
+
+_XRIZER_TRACKER_SERIALS_ - This is a semi-colon (`;`) separated list of device serial numbers to use as generic trackers. Can be used to assign controllers as FBT trackers.
 
 # See also
 
